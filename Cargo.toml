@@ -1,0 +1,13 @@
+[package]
+name = "zed-capture"
+version = "0.1.0"
+edition = "2024"
+description = "Stereolabs ZED 2 / 2i / Mini on Linux without the ZED SDK: V4L2 video into a frame ring, every IMU sample from hidraw"
+license = "MIT"
+publish = false
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+debug = "line-tables-only"
