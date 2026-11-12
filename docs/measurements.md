@@ -383,8 +383,12 @@ sequence skipping 2 a frame, no bad buffers, no USB error logged then): in 40 s,
 threads, 14-17 with 4, 22 with 6, none idle. The same with the busy loops at nice 19 or pinned
 away from CPU 0 (the USB host's interrupt), with or without the IMU, and with the build from
 before frame sync (14 with the sensors' sync output off, 32 with it on). On 2026-11-12 the same
-test had lost none with 6 busy threads. That night LabOrin ran on a power bank (36 %); not yet
-repeated on its wall supply.
+test had lost none with 6 busy threads. Not the power: LabOrin ran on a power bank (36 %), and on
+its wall supply after a reboot the same build lost 11 with 4 busy threads, the current one 13 with
+4, none with 6 and none idle; another 25 s with 4 lost 3, single frames at irregular times
+(8.9, 9.9, 24.2 s). So frames go missing when the CPUs are partly busy, 0-1.5 %, about the ZED
+SDK's own loss with pipeline_node alone (0.7-1.5 %). Not looked at yet (they need root): the CPUs'
+idle states, the USB host interrupt's affinity, uvcvideo's tracing; nor on the dog.
 
 ## Not measured
 
