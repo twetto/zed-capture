@@ -2,7 +2,7 @@
 //! IMU sample and each frame's time on the IMU's clock.
 //!
 //!   zed_grab OUT [--frames 5] [--every 15] [--skip 3] [--left-only] [--imu] [--video /dev/videoN]
-//!                [--mains 50|60] [--exposure-ms MS [--gain RAW]]
+//!                [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--read-left]
 //!
 //! `OUT/left/<ns>.pgm` and `OUT/right/<ns>.pgm`, named by the frame's kernel timestamp
 //! (CLOCK_MONOTONIC ns), one frame in every --every, after --skip seconds for the auto exposure to
@@ -44,9 +44,10 @@ struct Args {
     mains_hz: Option<u32>,
     exposure_ms: Option<f64>,
     gain: Option<u16>,
+    read_left: bool,
 }
 
-const USAGE: &str = "usage: zed_grab OUT [--frames 5] [--every 15] [--skip 3] [--left-only] [--imu] [--video /dev/videoN] [--mains 50|60] [--exposure-ms MS [--gain RAW]]";
+const USAGE: &str = "usage: zed_grab OUT [--frames 5] [--every 15] [--skip 3] [--left-only] [--imu] [--video /dev/videoN] [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--read-left]";
 
 fn args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
@@ -61,6 +62,7 @@ fn args() -> Result<Args, String> {
         mains_hz: None,
         exposure_ms: None,
         gain: None,
+        read_left: false,
     };
     let mut out = None;
     while let Some(arg) = it.next() {
@@ -77,6 +79,10 @@ fn args() -> Result<Args, String> {
             }
             "--imu" => {
                 a.imu = true;
+                continue;
+            }
+            "--read-left" => {
+                a.read_left = true;
                 continue;
             }
             _ => {}
@@ -138,6 +144,7 @@ impl Source {
 fn run(a: Args) -> io::Result<()> {
     let config = VideoConfig {
         mains_hz: a.mains_hz,
+        read_left_exposure: a.read_left,
         ..Default::default()
     };
     let (source, serial) = match (&a.video, a.imu) {

@@ -3,6 +3,7 @@
 //!
 //!   zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|nvjpg|raw] [--quality 90] [--every 1]
 //!                       [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--seconds S] [--encoders N]
+//!                       [--no-exposure-reads] [--read-left]
 //!
 //! Each image is stamped at its eye's middle row's mid-exposure, its `CameraExposure` beside it
 //! with the same stamp; `/zed/frame_timing` has every frame's pulse, both eyes' exposure and gain,
@@ -10,7 +11,9 @@
 //! system clock's offset measured when recording starts (see the file's `zed` metadata).
 //! Recording starts once the frame marks are fitted (~3 s after opening) and stops on SIGINT or
 //! SIGTERM, or after --seconds. --every N records every Nth frame's images (the timing and the
-//! IMU always); --encoders the threads encoding images (default: one per eye recorded).
+//! IMU always); --encoders the threads encoding images (default: one per eye recorded). Only the
+//! right sensor's exposure is read (the left image takes it), unless --read-left: reading the left
+//! sensor disturbs the camera's own exposure writes. --no-exposure-reads reads neither.
 //!
 //! If the video stops (no frame for 3 s: the camera went silent, or was unplugged), the camera is
 //! opened again and the recording goes on in the same file, from its first frame with a pulse;
@@ -38,7 +41,7 @@ use msgs::{Exposure, FrameTiming, Source};
 use zed_capture::{Camera, Devices, Frame, ManualExposure, VideoConfig, find, monotonic_ns};
 
 const EYES: [&str; 2] = ["left", "right"];
-const USAGE: &str = "usage: zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|nvjpg|raw] [--quality 90] [--every 1] [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--seconds S] [--encoders N] [--no-exposure-reads]";
+const USAGE: &str = "usage: zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|nvjpg|raw] [--quality 90] [--every 1] [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--seconds S] [--encoders N] [--no-exposure-reads] [--read-left]";
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static REOPEN: AtomicBool = AtomicBool::new(false);
@@ -70,6 +73,7 @@ struct Args {
     seconds: Option<f64>,
     encoders: Option<usize>,
     read_exposure: bool,
+    read_left: bool,
 }
 
 fn args() -> Result<Args, String> {
@@ -85,6 +89,7 @@ fn args() -> Result<Args, String> {
         seconds: None,
         encoders: None,
         read_exposure: true,
+        read_left: false,
     };
     let mut out = None;
     let mut it = std::env::args().skip(1);
@@ -97,6 +102,10 @@ fn args() -> Result<Args, String> {
         }
         if arg == "--no-exposure-reads" {
             a.read_exposure = false;
+            continue;
+        }
+        if arg == "--read-left" {
+            a.read_left = true;
             continue;
         }
         let value = it.next().ok_or(format!("{arg} needs a value"))?;
@@ -578,6 +587,7 @@ fn run(a: Args) -> Result<(), String> {
     let config = VideoConfig {
         mains_hz: a.mains_hz,
         read_exposure: a.read_exposure,
+        read_left_exposure: a.read_left,
         ..Default::default()
     };
     let opened = match open_camera(&a, &config, Duration::from_secs(15)) {
@@ -688,6 +698,14 @@ fn run(a: Args) -> Result<(), String> {
         put(
             "exposure_reads",
             "off (--no-exposure-reads): exposures unknown, stamps as if 0".into(),
+        );
+    } else if !a.read_left {
+        put(
+            "exposure_reads",
+            "the right sensor's only: the left image is stamped with the right's exposure \
+             (exposure source: the other eye; its gain 0, unknown). Reading the left sensor \
+             disturbs the camera's own exposure writes (--read-left to read it anyway)"
+                .into(),
         );
     }
     put("host", hostname());

@@ -211,8 +211,14 @@ pub struct VideoConfig {
     /// The mains frequency of the lights (Hz: 50, 60, or 0 for none), set at open (see
     /// [`Video::set_mains_hz`]); None leaves the camera's (50 Hz at power-up).
     pub mains_hz: Option<u32>,
-    /// [`crate::Camera`] reads both sensors' exposure and gain once a frame (true by default).
+    /// [`crate::Camera`] reads the sensors' exposure and gain once a frame (true by default).
     pub read_exposure: bool,
+    /// …the left sensor's too (false by default). Reading the left sensor's registers while the
+    /// camera streams now and then corrupts the camera's own writes of its exposure: the left
+    /// image went near black for 0.7-1.6 s, twice in a 4-minute walk, and never without the
+    /// reads (`docs/measurements.md`). The right sensor's are read alone, its exposure close to
+    /// the left's (the same in dim light; apart in bright light).
+    pub read_left_exposure: bool,
 }
 
 impl Default for VideoConfig {
@@ -225,6 +231,7 @@ impl Default for VideoConfig {
             ring: 8,
             mains_hz: None,
             read_exposure: true,
+            read_left_exposure: false,
         }
     }
 }
@@ -246,8 +253,8 @@ pub struct Frame {
     /// The MCU's count of this frame, with `sync_time_ns`.
     pub mcu_frame_count: Option<u32>,
     /// Each eye's exposure (ns; left, right), with `sync_time_ns`: the camera's auto exposure
-    /// runs for each eye apart. None for an eye whose sensor has not answered for a second (the
-    /// left's often does not):
+    /// runs for each eye apart. None for an eye not read (the left, unless
+    /// [`VideoConfig::read_left_exposure`]) or whose sensor has not answered for a second:
     /// [`Camera::next`](crate::Camera::next) says which reading.
     pub exposure_ns: [Option<u32>; 2],
     /// The middle of the exposure of each eye's image's middle row (host ns), with its

@@ -148,6 +148,7 @@ impl Camera {
                 sensors.clone(),
                 Duration::from_secs_f64(1.0 / video.fps()),
                 t.frame_length as u32,
+                [video.config().read_left_exposure, true],
             )?),
             _ => None,
         };
@@ -188,8 +189,9 @@ impl Camera {
     /// a thread of its own) from before the previous frame's pulse, and at most 1 s before:
     /// OmniVision's sensors take a new exposure at a frame's start, for the frame after. While the
     /// auto exposure changes, it may be a frame off; [`Camera::drain_exposure`] has every reading.
-    /// The left sensor often does not answer for a second or more: its exposure is then None (the
-    /// right's is close, but can be up to ~5 ms apart).
+    /// The left sensor's exposure is not read by default ([`VideoConfig::read_left_exposure`]):
+    /// its exposure is then None (the right's is close: the same in dim light, up to ~8 ms apart
+    /// in bright light).
     pub fn next(&self, timeout: Duration) -> io::Result<Option<(crate::Frame, Vec<ImuSample>)>> {
         let Some(mut frame) = self.video.next(timeout)? else {
             return Ok(None);

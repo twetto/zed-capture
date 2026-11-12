@@ -56,6 +56,24 @@ only the newest of each); V4L2 alone lost none. Details: mr-neuro-nav's
 - In the per-eye exposure runs, the left gave no good reading for over a second at a time often
   enough that 11-16 % of frames had no left exposure.
 
+### Reading the left sensor disturbs it
+
+Two walks along the same route on a battery, from the lab into a dark room and back, both eyes
+recorded:
+
+| Walk | Exposure reads | Length | Dark (right image's mean < 15) | Swings (> 30 in 0.1 s) | Left image near black alone |
+|---|---|---|---|---|---|
+| 1 | both sensors, every frame | 224 s | 12 s | 62 | 2: 0.67 s, 1.6 s |
+| 2 | none | 263 s | 54 s | 61 | 0 |
+
+Each time the left sensor's exposure and gain jumped in one step to 115 lines (4.6 ms) or 1 line
+at 1× gain (the auto exposure moves in small steps), and the auto exposure took 0.7-1.6 s to bring
+it back, while the right eye's held. The frame marks went on, so the sensor kept its other
+settings: its exposure and gain were overwritten, most likely a write of the camera's own colliding
+with our read on the left sensor's bus (the one whose reads fail). Two events against none is not
+proof; a static lights test with six swings and the reads on had none. Since then only the right
+sensor is read.
+
 ### One process on the extension unit at a time
 
 A read is two calls: the request, then its answer. A second process's request between them takes

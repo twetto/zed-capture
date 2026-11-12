@@ -403,11 +403,11 @@ fn exposure_from(mid: u32, low: u32, max_lines: u32) -> Option<u32> {
 /// A reading of both sensors' exposure.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExposureReading {
-    /// `CLOCK_MONOTONIC` ns: when the reading began (the left's).
+    /// `CLOCK_MONOTONIC` ns: when the reading began.
     pub time_ns: u64,
     /// How long both took (ns).
     pub read_ns: u32,
-    /// Per eye, in lines; None when the sensor did not answer.
+    /// Per eye, in lines; None when the sensor was not read or did not answer.
     pub lines: [Option<f32>; 2],
     /// Per eye, the raw gain read with the exposure (see [`GAIN_RANGES`]).
     pub gain: [Option<u16>; 2],
@@ -441,7 +441,7 @@ struct MonitorShared {
     stats: ExposureStats,
 }
 
-/// A thread reading both sensors' exposure once per `period`, until dropped.
+/// A thread reading the sensors' exposure once per `period`, until dropped.
 pub(crate) struct ExposureMonitor {
     shared: Arc<Mutex<MonitorShared>>,
     stop: Arc<AtomicBool>,
@@ -449,11 +449,13 @@ pub(crate) struct ExposureMonitor {
 }
 
 impl ExposureMonitor {
-    /// `max_lines`: the sensor's lines per frame; a longer exposure is a misread.
+    /// `max_lines`: the sensor's lines per frame; a longer exposure is a misread. `eyes`: the
+    /// sensors read.
     pub(crate) fn start(
         sensors: Sensors,
         period: Duration,
         max_lines: u32,
+        eyes: [bool; 2],
     ) -> io::Result<ExposureMonitor> {
         let shared = Arc::new(Mutex::new(MonitorShared::default()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -464,9 +466,11 @@ impl ExposureMonitor {
                 let mut next = Instant::now();
                 while !st.load(Ordering::Relaxed) {
                     let t0 = monotonic_ns();
-                    let read = sensors
-                        .exposure_and_gain(0, max_lines)
-                        .and_then(|l| Ok([l, sensors.exposure_and_gain(1, max_lines)?]));
+                    let read_eye = |eye: usize| match eyes[eye] {
+                        true => sensors.exposure_and_gain(eye, max_lines),
+                        false => Ok(None),
+                    };
+                    let read = read_eye(0).and_then(|l| Ok([l, read_eye(1)?]));
                     let read_ns = monotonic_ns() - t0;
                     let mut m = s.lock().unwrap();
                     match read {
@@ -478,7 +482,7 @@ impl ExposureMonitor {
                                 gain: sixteenths.map(|v| v.map(|(_, g)| g)),
                             };
                             for (eye, v) in sixteenths.iter().enumerate() {
-                                m.stats.unanswered[eye] += v.is_none() as u64;
+                                m.stats.unanswered[eye] += (eyes[eye] && v.is_none()) as u64;
                             }
                             if m.history.len() == HISTORY {
                                 m.history.pop_front();

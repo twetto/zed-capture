@@ -46,10 +46,13 @@ image's middle row; another row's is earlier or later by its distance from the m
 line time (`Camera::readout`). At HD720 at 30 Hz these times match the image's motion against the
 gyro within about 0.25 ms; other modes are not measured. See [docs/measurements.md](docs/measurements.md).
 
-**The left eye's exposure can be missing.** The camera's auto exposure runs for each eye apart, so
-each eye's exposure is read from its own sensor once a frame. The left sensor's registers often
-don't answer while the camera streams, so a frame's left exposure (and mid-exposure time) is None
-when the left sensor hasn't answered for a second. With a manual exposure, both are known exactly.
+**Only the right eye's exposure is read.** The camera's auto exposure runs for each eye apart, but
+reading the left sensor's registers while the camera streams now and then corrupts the camera's
+own exposure writes: the left image goes near black for a second or two. So `Camera` reads the
+right sensor's alone (`VideoConfig::read_left_exposure` to read the left's anyway), and a frame's
+left exposure is None: the right's is the same in dim light and can be several ms apart in
+bright light. `zed_record` stamps the left image with the right's exposure and says so. With a
+manual exposure, both eyes are known exactly.
 
 **Manual exposure.** `Video::set_manual_exposure` turns the camera's auto exposure off and sets an
 exposure and a raw gain on both sensors, as zed-open-capture does. The auto exposure comes back on
