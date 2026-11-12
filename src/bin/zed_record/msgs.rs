@@ -177,6 +177,7 @@ pub fn camera_exposure(stamp_ns: i64, frame_id: &str, e: &Exposure) -> Vec<u8> {
 /// Where an eye's exposure came from (`FrameTiming.exposure_source`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
+    None = 0,
     Own = 1,
     Manual = 2,
     OtherEye = 3,

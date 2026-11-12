@@ -98,6 +98,8 @@ zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|nvjpg|raw] [--qual
 Records the images, IMU and frame timing into one MCAP file of ROS 2 messages, with their
 definitions in the file: `ros2 bag info`, Foxglove and Python's `mcap-ros2-support` read it.
 Recording starts once the frame sync is ready (~3 s) and stops on Ctrl-C, SIGTERM or `--seconds`.
+If the video stops (no frame for 3 s: the camera went silent, or was unplugged), the recorder opens
+the camera again and goes on in the same file, about 3 s later; each stall is in the file's stats.
 
 | Topic | Type | Stamp |
 |---|---|---|

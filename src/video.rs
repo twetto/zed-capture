@@ -211,6 +211,8 @@ pub struct VideoConfig {
     /// The mains frequency of the lights (Hz: 50, 60, or 0 for none), set at open (see
     /// [`Video::set_mains_hz`]); None leaves the camera's (50 Hz at power-up).
     pub mains_hz: Option<u32>,
+    /// [`crate::Camera`] reads both sensors' exposure and gain once a frame (true by default).
+    pub read_exposure: bool,
 }
 
 impl Default for VideoConfig {
@@ -222,6 +224,7 @@ impl Default for VideoConfig {
             buffers: 8,
             ring: 8,
             mains_hz: None,
+            read_exposure: true,
         }
     }
 }

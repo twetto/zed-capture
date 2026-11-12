@@ -144,12 +144,12 @@ impl Camera {
                 }
             });
         let exposure = match &timing {
-            Ok(t) => Some(ExposureMonitor::start(
+            Ok(t) if video.config().read_exposure => Some(ExposureMonitor::start(
                 sensors.clone(),
                 Duration::from_secs_f64(1.0 / video.fps()),
                 t.frame_length as u32,
             )?),
-            Err(_) => None,
+            _ => None,
         };
         Ok(Camera {
             imu,

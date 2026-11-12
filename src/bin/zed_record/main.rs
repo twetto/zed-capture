@@ -11,6 +11,11 @@
 //! Recording starts once the frame marks are fitted (~3 s after opening) and stops on SIGINT or
 //! SIGTERM, or after --seconds. --every N records every Nth frame's images (the timing and the
 //! IMU always); --encoders the threads encoding images (default: one per eye recorded).
+//!
+//! If the video stops (no frame for 3 s: the camera went silent, or was unplugged), the camera is
+//! opened again and the recording goes on in the same file, from its first frame with a pulse;
+//! each stall is in the file's `stats` metadata. SIGUSR1 makes it reopen the camera at once (a
+//! test of that).
 
 mod cdr;
 mod msgs;
@@ -30,15 +35,20 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use msgs::{Exposure, FrameTiming, Source};
-use zed_capture::{Camera, VideoConfig, find, monotonic_ns};
+use zed_capture::{Camera, Devices, Frame, ManualExposure, VideoConfig, find, monotonic_ns};
 
 const EYES: [&str; 2] = ["left", "right"];
-const USAGE: &str = "usage: zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|nvjpg|raw] [--quality 90] [--every 1] [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--seconds S] [--encoders N]";
+const USAGE: &str = "usage: zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|nvjpg|raw] [--quality 90] [--every 1] [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--seconds S] [--encoders N] [--no-exposure-reads]";
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static REOPEN: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
+}
+
+extern "C" fn on_reopen(_: libc::c_int) {
+    REOPEN.store(true, Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -59,6 +69,7 @@ struct Args {
     gain: Option<u16>,
     seconds: Option<f64>,
     encoders: Option<usize>,
+    read_exposure: bool,
 }
 
 fn args() -> Result<Args, String> {
@@ -73,6 +84,7 @@ fn args() -> Result<Args, String> {
         gain: None,
         seconds: None,
         encoders: None,
+        read_exposure: true,
     };
     let mut out = None;
     let mut it = std::env::args().skip(1);
@@ -81,6 +93,10 @@ fn args() -> Result<Args, String> {
             if out.replace(PathBuf::from(&arg)).is_some() {
                 return Err(format!("one output file, not also {arg}"));
             }
+            continue;
+        }
+        if arg == "--no-exposure-reads" {
+            a.read_exposure = false;
             continue;
         }
         let value = it.next().ok_or(format!("{arg} needs a value"))?;
@@ -478,14 +494,23 @@ fn context(what: &'static str) -> impl Fn(io::Error) -> String {
     move |e| format!("{what}: {e}")
 }
 
-fn run(a: Args) -> Result<(), String> {
-    let d = find().map_err(context("the camera"))?;
-    let config = VideoConfig {
-        mains_hz: a.mains_hz,
-        ..Default::default()
-    };
-    let camera =
-        Camera::open(&d.video, Some(&d.hid), config.clone()).map_err(context("opening"))?;
+/// A camera opened for recording, and its first frame with a pulse.
+struct Opened {
+    camera: Camera,
+    devices: Devices,
+    manual: Option<ManualExposure>,
+    first: Frame,
+}
+
+/// What stopping looks like while opening.
+const STOPPED: &str = "stopped";
+
+/// Finds and opens the camera, sets the manual exposure if asked, and waits up to `wait` for its
+/// first frame with a pulse (the frame marks fitted).
+fn open_camera(a: &Args, config: &VideoConfig, wait: Duration) -> Result<Opened, String> {
+    let devices = find().map_err(context("the camera"))?;
+    let camera = Camera::open(&devices.video, Some(&devices.hid), config.clone())
+        .map_err(context("opening"))?;
     if let Err(m) = camera.frame_sync() {
         eprintln!("zed_record: the frame marks were not turned on ({m}); waiting for them anyway");
     }
@@ -498,6 +523,74 @@ fn run(a: Args) -> Result<(), String> {
         ),
         None => None,
     };
+    let waiting = Instant::now();
+    loop {
+        if STOP.load(Ordering::Relaxed) {
+            return Err(STOPPED.into());
+        }
+        if waiting.elapsed() > wait {
+            return Err(format!("no frame sync after {} s", wait.as_secs()));
+        }
+        let Some((first, _)) = camera
+            .next(Duration::from_secs(1))
+            .map_err(context("the camera"))?
+        else {
+            continue;
+        };
+        if first.sync_time_ns.is_some() && camera.readout().is_some() {
+            return Ok(Opened {
+                camera,
+                devices,
+                manual,
+                first,
+            });
+        }
+    }
+}
+
+/// What was lost, over every time the camera was opened.
+#[derive(Default)]
+struct Lost {
+    by_time: u64,
+    ring_drops: u64,
+    imu_missing: u64,
+    readings: u64,
+    unanswered: [u64; 2],
+}
+
+impl Lost {
+    fn add(&mut self, camera: &Camera) {
+        let v = camera.video().stats();
+        self.by_time += v.missing_by_time;
+        self.ring_drops += v.ring_drops;
+        if let Some(imu) = camera.imu() {
+            self.imu_missing += imu.stats().missing;
+        }
+        if let Some(x) = camera.exposure_stats() {
+            self.readings += x.readings;
+            self.unanswered[0] += x.unanswered[0];
+            self.unanswered[1] += x.unanswered[1];
+        }
+    }
+}
+
+fn run(a: Args) -> Result<(), String> {
+    let config = VideoConfig {
+        mains_hz: a.mains_hz,
+        read_exposure: a.read_exposure,
+        ..Default::default()
+    };
+    let opened = match open_camera(&a, &config, Duration::from_secs(15)) {
+        Ok(o) => o,
+        Err(e) if e == STOPPED => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let Opened {
+        camera,
+        devices: d,
+        mut manual,
+        first,
+    } = opened;
     let timing = camera
         .sensor_timing()
         .map_err(|m| format!("the sensors' timing: {m}"))?;
@@ -518,26 +611,7 @@ fn run(a: Args) -> Result<(), String> {
             .map_err(|e| format!("the {:?} encoder: {e}", a.encoding))?;
     }
 
-    // Recording starts with the first frame that has its pulse
-    let waiting = Instant::now();
-    let first = loop {
-        if STOP.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        if waiting.elapsed() > Duration::from_secs(15) {
-            return Err("no frame sync after 15 s".into());
-        }
-        let Some((frame, _)) = camera
-            .next(Duration::from_secs(1))
-            .map_err(context("the camera"))?
-        else {
-            continue;
-        };
-        if frame.sync_time_ns.is_some() && camera.readout().is_some() {
-            break frame;
-        }
-    };
-    let readout = camera.readout().expect("checked above");
+    let readout = camera.readout().expect("open_camera waits for it");
     let (offset_ns, start_mono, start_real) = clock_offset();
 
     let mut zed = BTreeMap::new();
@@ -610,6 +684,12 @@ fn run(a: Args) -> Result<(), String> {
             .into(),
     );
     put("imu_axes", "the IMU's own, not the cameras'".into());
+    if !a.read_exposure {
+        put(
+            "exposure_reads",
+            "off (--no-exposure-reads): exposures unknown, stamps as if 0".into(),
+        );
+    }
     put("host", hostname());
     put("recorder", std::env::args().collect::<Vec<_>>().join(" "));
     let calibration = d.serial.as_ref().and_then(|s| {
@@ -676,21 +756,63 @@ fn run(a: Args) -> Result<(), String> {
     if let Some(imu) = camera.imu() {
         imu.reset_stats();
     }
-    while result.is_ok()
-        && !STOP.load(Ordering::Relaxed)
-        && a.seconds
-            .is_none_or(|s| started.elapsed().as_secs_f64() < s)
-    {
-        let (mut f, samples) = match pending.take() {
-            Some(x) => x,
-            None => match camera.next(Duration::from_secs(1)) {
-                Ok(Some(x)) => x,
-                Ok(None) => continue,
-                Err(err) => {
-                    result = Err(format!("the camera: {err}"));
+    let mut camera = Some(camera);
+    let mut lost = Lost::default();
+    let mut stalls: Vec<String> = Vec::new();
+    let running = || {
+        !STOP.load(Ordering::Relaxed)
+            && a.seconds
+                .is_none_or(|s| started.elapsed().as_secs_f64() < s)
+    };
+    while result.is_ok() && running() {
+        let next = match pending.take() {
+            Some(x) => Ok(Some(x)),
+            None if REOPEN.swap(false, Ordering::Relaxed) => Err("SIGUSR1".to_string()),
+            None => camera
+                .as_ref()
+                .expect("open")
+                .next(Duration::from_secs(1))
+                .map_err(|e| format!("the camera stopped: {e}")),
+        };
+        let (mut f, samples) = match next {
+            Ok(Some(x)) => x,
+            Ok(None) => continue,
+            Err(why) => {
+                // The camera stopped: open it again, and go on in the same file
+                let at = started.elapsed().as_secs_f64();
+                eprintln!("zed_record: {at:.1} s: {why}; opening the camera again");
+                if let Some(c) = camera.take() {
+                    lost.add(&c);
+                }
+                while camera.is_none() && running() {
+                    match open_camera(&a, &config, Duration::from_secs(15)) {
+                        Ok(o) => {
+                            manual = o.manual;
+                            pending = Some((o.first, Vec::new()));
+                            camera = Some(o.camera);
+                        }
+                        Err(e) if e == STOPPED => break,
+                        Err(e) => {
+                            eprintln!("zed_record: opening the camera again: {e}");
+                            std::thread::sleep(Duration::from_secs(2));
+                        }
+                    }
+                }
+                let gap = started.elapsed().as_secs_f64() - at;
+                stalls.push(format!(
+                    "at {at:.1} s ({why}): {}",
+                    if camera.is_some() {
+                        format!("recording again after {gap:.1} s")
+                    } else {
+                        format!("not open again by the end, {gap:.1} s later")
+                    }
+                ));
+                eprintln!("zed_record: {}", stalls.last().unwrap());
+                if camera.is_none() {
                     break;
                 }
-            },
+                continue;
+            }
         };
         for s in &samples {
             let t = s.time_ns as i64 + offset_ns;
@@ -707,7 +829,7 @@ fn run(a: Args) -> Result<(), String> {
             counts.without_pulse += 1;
             continue;
         };
-        let readout = camera.readout().unwrap_or(readout);
+        let readout = camera.as_ref().and_then(|c| c.readout()).unwrap_or(readout);
         let middle = pulse as f64 + readout.middle_row_ns(f.height);
         // Each eye's exposure (ns) and gain, and where they came from
         let mut eye_exposure = [None; 2];
@@ -732,6 +854,8 @@ fn run(a: Args) -> Result<(), String> {
                     Some((ex, gain, Source::OtherEye))
                 }
                 (_, Some((ex, _))) => Some((ex, gain, Source::LastKnown)),
+                // Not read (--no-exposure-reads): stamped as if 0, the images still recorded
+                _ if !a.read_exposure => Some((0.0, 0, Source::None)),
                 _ => None,
             };
         }
@@ -808,7 +932,9 @@ fn run(a: Args) -> Result<(), String> {
         let _ = h.join();
     }
 
-    let v = camera.video().stats();
+    if let Some(c) = camera.as_ref() {
+        lost.add(c);
+    }
     let mut stats = BTreeMap::new();
     let mut put = |k: &str, v: String| {
         stats.insert(k.to_string(), v);
@@ -820,20 +946,20 @@ fn run(a: Args) -> Result<(), String> {
         "frames_without_exposure",
         counts.without_exposure.to_string(),
     );
-    put("frames_lost_by_time", v.missing_by_time.to_string());
-    put("ring_drops", v.ring_drops.to_string());
+    put("frames_lost_by_time", lost.by_time.to_string());
+    put("ring_drops", lost.ring_drops.to_string());
     put("imu_samples", counts.imu_samples.to_string());
-    if let Some(imu) = camera.imu() {
-        put("imu_missing", imu.stats().missing.to_string());
-    }
-    if let Some(x) = camera.exposure_stats() {
-        put(
-            "exposure_readings_unanswered",
-            format!(
-                "left {} right {} of {}",
-                x.unanswered[0], x.unanswered[1], x.readings
-            ),
-        );
+    put("imu_missing", lost.imu_missing.to_string());
+    put(
+        "exposure_readings_unanswered",
+        format!(
+            "left {} right {} of {}",
+            lost.unanswered[0], lost.unanswered[1], lost.readings
+        ),
+    );
+    put("stalls", stalls.len().to_string());
+    for (i, st) in stalls.iter().enumerate() {
+        put(&format!("stall_{}", i + 1), st.clone());
     }
     for (k, n) in &counts.exposure_from {
         put(&format!("exposure_from_{k}"), n.to_string());
@@ -896,6 +1022,8 @@ fn main() -> ExitCode {
         let handler = on_signal as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
         libc::signal(libc::SIGINT, handler);
         libc::signal(libc::SIGTERM, handler);
+        let reopen = on_reopen as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGUSR1, reopen);
     }
     match run(a) {
         Ok(()) => ExitCode::SUCCESS,
