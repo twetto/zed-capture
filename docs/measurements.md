@@ -154,6 +154,22 @@ Each read is a request and its answer through the extension unit, about 1.75 ms.
 eye (two bytes, twice) take about 7 ms; both eyes about 14 ms, once a frame. No frame or IMU sample
 was lost with it.
 
+## Recording (`zed_record`)
+
+60 s at 30 Hz on LabOrin, auto exposure at 60 Hz mains:
+
+| Recording | Frames lost | Encoding | File |
+|---|---|---|---|
+| both eyes, JPEG q90 (2 runs) | 1 of 1801 each | 10.1-10.3 ms an image (CPU) | 6.2 MB/s, ~100 KiB an image |
+| left eye, JPEG q90 (20 s) | 0 of 601 | 10.3 ms | 3.5 MB/s |
+| both eyes, raw (10 s) | 0 of 302 | 0.3 ms | 56 MB/s |
+
+The recorder took 65 % of one core with both eyes in JPEG. The lost frames were lost in the kernel
+(the MCU's count and the kernel's sequence both jumped), not by zed-capture; recording without
+encoding lost none, so the encoding's CPU likely delays the USB interrupts (on CPU0). Reading
+each eye's exposure and gain in one request (registers 0x3500-0x3509) took 6.9 ms a frame for
+both eyes, read twice, against 13.9 ms for the exposure alone byte by byte.
+
 ## Not measured
 
 - Other video modes and frame rates (the 0.31 ms is measured at HD720 at 30 Hz only).

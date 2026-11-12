@@ -8,6 +8,16 @@ publish = false
 
 [dependencies]
 libc = "0.2"
+# zed_record's: MCAP without zstd/lz4 (JPEG does not compress), JPEG in pure Rust
+mcap = { version = "0.26", default-features = false, optional = true }
+jpeg-encoder = { version = "0.7", optional = true }
+
+[features]
+record = ["dep:mcap", "dep:jpeg-encoder"]
+
+[[bin]]
+name = "zed_record"
+required-features = ["record"]
 
 [profile.release]
 debug = "line-tables-only"

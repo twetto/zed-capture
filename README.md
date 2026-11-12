@@ -90,10 +90,36 @@ Saves left and right grey as PGM files named by their kernel stamp, and the came
 `imu.csv` (every sample), `exposure.csv` (every exposure reading) and `readout.csv` (the line
 time).
 
+```
+zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|raw] [--quality 90] [--every 1]
+                    [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--seconds S]
+```
+
+Records the images, IMU and frame timing into one MCAP file of ROS 2 messages, with their
+definitions in the file: `ros2 bag info`, Foxglove and Python's `mcap-ros2-support` read it.
+Recording starts once the frame sync is ready (~3 s) and stops on Ctrl-C, SIGTERM or `--seconds`.
+
+| Topic | Type | Stamp |
+|---|---|---|
+| `/zed/<eye>/image_raw/compressed` | `sensor_msgs/CompressedImage` (grey JPEG) | the eye's mid-exposure |
+| `/zed/<eye>/exposure` | `v4l2_trigger_camera/CameraExposure` | its image's |
+| `/zed/frame_timing` | `zed_capture/FrameTiming` | the frame's pulse |
+| `/zed/imu` | `sensor_msgs/Imu` (the IMU's axes; no orientation) | the sample |
+| `/zed/clock` | `zed_capture/ClockOffset` | once a second |
+
+`image_raw` is unrectified; the camera's factory calibration is attached to the file. With
+`--encoding raw` the images are `sensor_msgs/Image` (mono8) on `/zed/<eye>/image_raw`. Every frame's
+`FrameTiming` has both eyes' exposure, gain and mid-exposure, where each exposure came from (the
+eye's own sensor, set by hand, or the other eye's when the left sensor did not answer), and the
+line time for rolling-shutter work. Stamps are `CLOCK_MONOTONIC` plus the system clock's offset at
+the start, one offset for the whole file (an NTP step during recording shows on `/zed/clock`).
+The file's `zed` metadata has the settings, its `stats` metadata what was recorded and lost.
+
 ## Building for a Jetson (JetPack 6)
 
 ```
 cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.35
+cargo zigbuild --release --features record --target aarch64-unknown-linux-gnu.2.35  # zed_record too
 ```
 
 The user needs read and write access to `/dev/videoN` (the `video` group) and
