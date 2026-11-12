@@ -105,16 +105,22 @@ pub fn write_system_register(fd: RawFd, len: usize, address: u32, value: u8) -> 
     request(fd, len, &mut b, false)
 }
 
-fn sensor_request(task: u8, eye: usize, register: u16) -> [u8; REQUEST_LEN] {
+/// The most consecutive registers one read returns (more come back as zeros: a ZED 2i).
+pub const MAX_BLOCK: usize = 13;
+/// Where a read's answer starts in the request buffer.
+const ANSWER: usize = 17;
+
+fn sensor_request(task: u8, eye: usize, register: u16, count: usize) -> [u8; REQUEST_LEN] {
     let mut b = [0u8; REQUEST_LEN];
     b[0] = task;
     b[1] = I2C[eye];
     b[2] = SENSOR_ADDRESS;
     b[3] = 2; // register address bytes
-    b[4] = 1; // data bytes
+    b[4] = 1; // data bytes per register
     b[5..9].copy_from_slice(&(register as u32).to_be_bytes());
-    b[9] = 0x90; // one byte (high bits of the count), with zed-open-capture's page flags
-    b[10] = 0x01;
+    // The count of registers (12 bits), with zed-open-capture's page flags
+    b[9] = 0x90 | (count >> 8) as u8 & 0x0f;
+    b[10] = count as u8;
     b[12] = 0x01;
     b
 }
@@ -122,9 +128,25 @@ fn sensor_request(task: u8, eye: usize, register: u16) -> [u8; REQUEST_LEN] {
 /// One byte of an image sensor's register (`eye` 0 left, 1 right), with requests of `len`
 /// ([`request_len`]). 0xff or 0x00 when the sensor does not answer (see [`crate::sensor`]).
 pub fn read_sensor_register(fd: RawFd, len: usize, eye: usize, register: u16) -> io::Result<u8> {
-    let mut b = sensor_request(TASK_GET, eye, register);
+    let mut b = [0u8];
+    read_sensor_block(fd, len, eye, register, &mut b)?;
+    Ok(b[0])
+}
+
+/// `out.len()` (1 to [`MAX_BLOCK`]) consecutive registers from `register` on, in one request (the
+/// same time as one register).
+pub fn read_sensor_block(
+    fd: RawFd,
+    len: usize,
+    eye: usize,
+    register: u16,
+    out: &mut [u8],
+) -> io::Result<()> {
+    assert!((1..=MAX_BLOCK).contains(&out.len()) && ANSWER + out.len() <= len);
+    let mut b = sensor_request(TASK_GET, eye, register, out.len());
     request(fd, len, &mut b, true)?;
-    Ok(b[17])
+    out.copy_from_slice(&b[ANSWER..ANSWER + out.len()]);
+    Ok(())
 }
 
 pub fn write_sensor_register(
@@ -134,7 +156,7 @@ pub fn write_sensor_register(
     register: u16,
     value: u8,
 ) -> io::Result<()> {
-    let mut b = sensor_request(TASK_SET, eye, register);
+    let mut b = sensor_request(TASK_SET, eye, register, 1);
     b[16] = value;
     request(fd, len, &mut b, false)
 }
@@ -146,11 +168,14 @@ mod tests {
     #[test]
     fn ioctl_number_and_request_layout() {
         assert_eq!(UVCIOC_CTRL_QUERY, 0xc010_7521);
-        let b = sensor_request(TASK_GET, 1, REG_SYNC_OUTPUT);
+        let b = sensor_request(TASK_GET, 1, REG_SYNC_OUTPUT, 1);
         assert_eq!(
             &b[..13],
             &[0x51, 0xa5, 0x6c, 2, 1, 0, 0, 0x30, 0x02, 0x90, 1, 0, 1]
         );
+        // Ten registers: the count in bytes 9 (high nibble) and 10
+        let b = sensor_request(TASK_GET, 0, 0x3500, 10);
+        assert_eq!(&b[9..11], &[0x90, 10]);
         // zed-open-capture's ll_write_system_register, the left ISP's control
         let s = system_request(TASK_SET, 0x8018_1033);
         assert_eq!(

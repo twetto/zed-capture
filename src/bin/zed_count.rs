@@ -354,6 +354,8 @@ struct SyncCheck {
     mid_after_pulse: [Vec<i64>; 2],
     /// Right's exposure − left's, when both.
     eye_difference: Vec<i64>,
+    /// Per eye, each frame's raw gain.
+    gain: [Vec<i64>; 2],
 }
 
 impl SyncCheck {
@@ -378,6 +380,9 @@ impl SyncCheck {
             }
             if let Some(mid) = frame.mid_exposure_ns[eye] {
                 self.mid_after_pulse[eye].push(mid as i64 - t as i64);
+            }
+            if let Some(g) = frame.gain[eye] {
+                self.gain[eye].push(g as i64);
             }
         }
         if let [Some(l), Some(r)] = frame.exposure_ns {
@@ -414,6 +419,16 @@ impl SyncCheck {
                 "  {name}: middle row's mid-exposure after the pulse {}",
                 quantiles(&mut self.mid_after_pulse[eye])
             );
+            let g = &mut self.gain[eye];
+            g.sort();
+            if !g.is_empty() {
+                println!(
+                    "  {name}: raw gain min {} median {} max {}",
+                    g[0],
+                    g[g.len() / 2],
+                    g[g.len() - 1]
+                );
+            }
         }
         println!(
             "  right's exposure less the left's: {}",

@@ -74,6 +74,12 @@ impl Device {
         xu::read_sensor_register(self.file.as_raw_fd(), len, eye, register)
     }
 
+    /// Consecutive registers from `register` on, in one request (up to [`xu::MAX_BLOCK`]).
+    fn read_block(&mut self, eye: usize, register: u16, out: &mut [u8]) -> io::Result<()> {
+        let len = self.len()?;
+        xu::read_sensor_block(self.file.as_raw_fd(), len, eye, register, out)
+    }
+
     fn write(&mut self, eye: usize, register: u16, value: u8) -> io::Result<()> {
         let len = self.len()?;
         xu::write_sensor_register(self.file.as_raw_fd(), len, eye, register, value)
@@ -92,11 +98,10 @@ impl Device {
     /// `bytes` registers from `register` on, big-endian, read twice; None unless the same.
     fn read_be_twice(&mut self, eye: usize, register: u16, bytes: u16) -> io::Result<Option<u32>> {
         let mut once = || -> io::Result<u32> {
-            let mut v = 0u32;
-            for i in 0..bytes {
-                v = v << 8 | self.read(eye, register + i)? as u32;
-            }
-            Ok(v)
+            let mut b = [0u8; 4];
+            let b = &mut b[..bytes as usize];
+            self.read_block(eye, register, b)?;
+            Ok(b.iter().fold(0, |v, &x| v << 8 | x as u32))
         };
         let a = once()?;
         Ok((once()? == a).then_some(a))
@@ -326,18 +331,38 @@ impl Sensors {
         t.ok_or_else(|| not_answering(eye, wait))
     }
 
-    /// A sensor's exposure, in 1/16 lines, with frames of `max_lines` (under 4096: the high
-    /// bits are 0); None unless the two bytes read the same twice and make 1 to `max_lines`
-    /// lines.
+    /// A sensor's exposure, in 1/16 lines (see [`Sensors::exposure_and_gain`]).
     pub fn exposure_16ths(&self, eye: usize, max_lines: u32) -> io::Result<Option<u32>> {
+        Ok(self.exposure_and_gain(eye, max_lines)?.map(|(e, _)| e))
+    }
+
+    /// A sensor's exposure (1/16 lines) and raw gain, with frames of `max_lines` (under 4096):
+    /// its registers 0x3500-0x3509 read in one request, twice. None unless both reads are the
+    /// same and hold an exposure (1 to `max_lines` lines; its high byte 0) and a gain the sensor
+    /// takes (its first byte 0).
+    pub fn exposure_and_gain(&self, eye: usize, max_lines: u32) -> io::Result<Option<(u32, u16)>> {
         let mut device = self.device.lock().unwrap();
-        let mut r = |register| device.read(eye, register).map(u32::from);
-        let first = [r(REG_EXPOSURE + 1)?, r(REG_EXPOSURE + 2)?];
-        let second = [r(REG_EXPOSURE + 1)?, r(REG_EXPOSURE + 2)?];
-        Ok((first == second)
-            .then(|| exposure_from(first[0], first[1], max_lines))
+        let mut a = [0u8; EXPOSURE_GAIN_BLOCK];
+        let mut b = [0u8; EXPOSURE_GAIN_BLOCK];
+        device.read_block(eye, REG_EXPOSURE, &mut a)?;
+        device.read_block(eye, REG_EXPOSURE, &mut b)?;
+        Ok((a == b)
+            .then(|| exposure_gain_from(&a, max_lines))
             .flatten())
     }
+}
+
+/// Registers 0x3500 (exposure) to 0x3509 (gain's low byte).
+const EXPOSURE_GAIN_BLOCK: usize = (REG_GAIN - REG_EXPOSURE) as usize + 3;
+
+/// The exposure (1/16 lines) and raw gain from registers 0x3500-0x3509, if they hold them.
+fn exposure_gain_from(b: &[u8; EXPOSURE_GAIN_BLOCK], max_lines: u32) -> Option<(u32, u16)> {
+    let g = (REG_GAIN - REG_EXPOSURE) as usize;
+    let gain = u16::from_be_bytes([b[g + 1], b[g + 2]]);
+    let ok = b[0] == 0 && b[g] == 0 && GAIN_RANGES.iter().any(|r| r.contains(&gain));
+    ok.then(|| exposure_from(b[1] as u32, b[2] as u32, max_lines))
+        .flatten()
+        .map(|e| (e, gain))
 }
 
 fn not_answering(eye: usize, wait: Duration) -> io::Error {
@@ -367,6 +392,8 @@ pub struct ExposureReading {
     pub read_ns: u32,
     /// Per eye, in lines; None when the sensor did not answer.
     pub lines: [Option<f32>; 2],
+    /// Per eye, the raw gain read with the exposure (see [`GAIN_RANGES`]).
+    pub gain: [Option<u16>; 2],
 }
 
 /// Counts since the monitor started.
@@ -421,8 +448,8 @@ impl ExposureMonitor {
                 while !st.load(Ordering::Relaxed) {
                     let t0 = monotonic_ns();
                     let read = sensors
-                        .exposure_16ths(0, max_lines)
-                        .and_then(|l| Ok([l, sensors.exposure_16ths(1, max_lines)?]));
+                        .exposure_and_gain(0, max_lines)
+                        .and_then(|l| Ok([l, sensors.exposure_and_gain(1, max_lines)?]));
                     let read_ns = monotonic_ns() - t0;
                     let mut m = s.lock().unwrap();
                     match read {
@@ -430,7 +457,8 @@ impl ExposureMonitor {
                             let reading = ExposureReading {
                                 time_ns: t0,
                                 read_ns: read_ns.min(u32::MAX as u64) as u32,
-                                lines: sixteenths.map(|v| v.map(|v| v as f32 / 16.0)),
+                                lines: sixteenths.map(|v| v.map(|(e, _)| e as f32 / 16.0)),
+                                gain: sixteenths.map(|v| v.map(|(_, g)| g)),
                             };
                             for (eye, v) in sixteenths.iter().enumerate() {
                                 m.stats.unanswered[eye] += v.is_none() as u64;
@@ -471,7 +499,7 @@ impl ExposureMonitor {
 
     /// Each sensor's exposure (lines) from its newest answer begun at or before `time_ns`, and
     /// at most a second before.
-    pub(crate) fn at(&self, time_ns: u64) -> [Option<f32>; 2] {
+    pub(crate) fn at(&self, time_ns: u64) -> [Option<(f32, u16)>; 2] {
         let m = self.shared.lock().unwrap();
         [0, 1].map(|eye| newest_answer(&m.history, eye, time_ns))
     }
@@ -487,13 +515,17 @@ impl ExposureMonitor {
 
 /// `eye`'s newest answer in `history` (oldest first) begun at or before `time_ns`, and at most
 /// `STALE_NS` before.
-fn newest_answer(history: &VecDeque<ExposureReading>, eye: usize, time_ns: u64) -> Option<f32> {
+fn newest_answer(
+    history: &VecDeque<ExposureReading>,
+    eye: usize,
+    time_ns: u64,
+) -> Option<(f32, u16)> {
     history
         .iter()
         .rev()
         .skip_while(|r| r.time_ns > time_ns)
         .take_while(|r| r.time_ns + STALE_NS >= time_ns)
-        .find_map(|r| r.lines[eye])
+        .find_map(|r| Some((r.lines[eye]?, r.gain[eye]?)))
 }
 
 impl Drop for ExposureMonitor {
@@ -522,12 +554,30 @@ mod tests {
         assert_eq!(exposure_from(0x34, 0x01, 832), None);
     }
 
+    fn lines_at(h: &VecDeque<ExposureReading>, eye: usize, t: u64) -> Option<f32> {
+        newest_answer(h, eye, t).map(|(l, _)| l)
+    }
+
+    #[test]
+    fn exposure_and_gain_registers() {
+        // 0x3500-0x3509 on LabOrin's right sensor at 60 Hz: 621 lines, gain 192
+        let mut b = [0u8; EXPOSURE_GAIN_BLOCK];
+        b[..10].copy_from_slice(&[0x00, 0x26, 0xd0, 0x04, 0, 0, 0, 0x00, 0x00, 0xc0]);
+        assert_eq!(exposure_gain_from(&b, 832), Some((621 * 16, 192)));
+        // A gain the sensor does not take, a sensor that does not answer
+        b[8..10].copy_from_slice(&[0x01, 0x10]);
+        assert_eq!(exposure_gain_from(&b, 832), None);
+        assert_eq!(exposure_gain_from(&[0xff; EXPOSURE_GAIN_BLOCK], 832), None);
+        assert_eq!(exposure_gain_from(&[0x00; EXPOSURE_GAIN_BLOCK], 832), None);
+    }
+
     #[test]
     fn each_eye_from_its_newest_answer() {
         let r = |ms: u64, l: Option<f32>, r: Option<f32>| ExposureReading {
             time_ns: ms * 1_000_000,
             read_ns: 0,
             lines: [l, r],
+            gain: [l.map(|_| 440), r.map(|_| 200)],
         };
         let h: VecDeque<_> = [
             r(0, Some(498.0), Some(621.0)),
@@ -536,17 +586,18 @@ mod tests {
             r(100, Some(500.0), Some(619.0)),
         ]
         .into();
-        let at = |t: u64| [0, 1].map(|eye| newest_answer(&h, eye, t * 1_000_000));
+        let at = |t: u64| [0, 1].map(|eye| lines_at(&h, eye, t * 1_000_000));
+        assert_eq!(newest_answer(&h, 1, 80_000_000), Some((620.0, 200)));
         assert_eq!(at(80), [Some(498.0), Some(620.0)]);
         assert_eq!(at(100), [Some(500.0), Some(619.0)]);
         assert_eq!(at(0), [Some(498.0), Some(621.0)]);
         // Nothing before the first reading, nothing over a second old
-        assert_eq!(newest_answer(&h, 0, 0), Some(498.0));
+        assert_eq!(lines_at(&h, 0, 0), Some(498.0));
         let late: VecDeque<_> = [r(1, Some(1.0), Some(2.0)), r(5, None, Some(3.0))].into();
-        assert_eq!(newest_answer(&late, 0, 1_002_000_000), None);
-        assert_eq!(newest_answer(&late, 1, 1_002_000_000), Some(3.0));
-        assert_eq!(newest_answer(&late, 0, 1_000_500_000), Some(1.0));
+        assert_eq!(lines_at(&late, 0, 1_002_000_000), None);
+        assert_eq!(lines_at(&late, 1, 1_002_000_000), Some(3.0));
+        assert_eq!(lines_at(&late, 0, 1_000_500_000), Some(1.0));
         let one: VecDeque<_> = [r(10, Some(1.0), Some(1.0))].into();
-        assert_eq!(newest_answer(&one, 0, 9_000_000), None);
+        assert_eq!(lines_at(&one, 0, 9_000_000), None);
     }
 }

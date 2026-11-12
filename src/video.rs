@@ -251,6 +251,9 @@ pub struct Frame {
     /// `exposure_ns`: see [`Camera::next`](crate::Camera::next). Rolling shutter: the other
     /// rows' come up to half a readout (HD720: 14.5 ms) before and after it.
     pub mid_exposure_ns: [Option<u64>; 2],
+    /// Each eye's raw gain (the OV4689's register, in [`crate::sensor::GAIN_RANGES`]; not a
+    /// multiplier), read with its exposure.
+    pub gain: [Option<u16>; 2],
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
@@ -803,6 +806,7 @@ impl Capture {
                     mcu_frame_count: None,
                     exposure_ns: [None; 2],
                     mid_exposure_ns: [None; 2],
+                    gain: [None; 2],
                     pool: self.pool.clone(),
                 })
             } else {

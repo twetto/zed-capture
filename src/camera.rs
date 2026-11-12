@@ -206,16 +206,21 @@ impl Camera {
             if let Some(readout) = self.readout_with(&clock) {
                 // The exposure in force: set before the previous frame's pulse
                 let set_by = time as f64 - clock.period_ns;
-                let exposure = match self
+                let (exposure, gain) = match self
                     .video
                     .manual_exposure()
                     .filter(|m| (m.since_ns as f64) < set_by)
                 {
-                    Some(m) => [Some(m.lines as f64 * readout.line_ns); 2],
-                    None => self
-                        .exposure_at(set_by)
-                        .map(|l| l.map(|l| l as f64 * readout.line_ns)),
+                    Some(m) => ([Some(m.lines as f64 * readout.line_ns); 2], m.gain),
+                    None => {
+                        let read = self.exposure_at(set_by);
+                        (
+                            read.map(|r| r.map(|(lines, _)| lines as f64 * readout.line_ns)),
+                            read.map(|r| r.map(|(_, gain)| gain)),
+                        )
+                    }
                 };
+                frame.gain = gain;
                 let middle = time as f64 + readout.middle_row_ns(frame.height);
                 frame.exposure_ns = exposure.map(|e| e.map(|e| e.round() as u32));
                 frame.mid_exposure_ns =
@@ -237,7 +242,7 @@ impl Camera {
         (time > 0.0).then(|| (time as u64, clock.count.wrapping_add(frames as u32)))
     }
 
-    fn exposure_at(&self, time_ns: f64) -> [Option<f32>; 2] {
+    fn exposure_at(&self, time_ns: f64) -> [Option<(f32, u16)>; 2] {
         match &self.exposure {
             Some(m) => m.at(time_ns.max(0.0) as u64),
             None => [None; 2],
