@@ -54,14 +54,15 @@ exposure the camera's auto exposure set, once a frame, from the right sensor's r
 auto exposure gives both sensors the same; the left's registers often don't answer while the
 camera streams: they read 0xff or 0x00, for single reads or seconds on end), and gives each frame
 its exposure (`Frame::exposure_ns`) and the middle of the exposure of its middle row
-(`Frame::mid_exposure_ns`): the pulse, plus the frame's blanking lines (4.33 ms), plus the
-readout to that row, less half the exposure. In the lab at night (30 ms exposure) that is
-3.8 ms after the pulse; in daylight (a few ms) ~17 ms. Turning the camera by hand while it
-recorded (rotation from the images against the gyro, in six bands of rows) found the top row
-read first, 39.7 µs a row, and the blanking first: the image's middle
-row within 0.1-0.3 ms of `mid_exposure_ns` at a 30 ms exposure; a short exposure is still to
-be checked. The kernel's stamp comes 1.4 ms after the pulse, before the first row is read: the
-camera starts each frame's transfer during the blanking.
+(`Frame::mid_exposure_ns`): the pulse, plus 4.02 ms to the first row (the frame's blanking
+lines, 4.33 ms, less 0.31 ms measured), plus the readout to that row, less half the exposure.
+In the lab at night (30 ms exposure) that is 3.5 ms after the pulse; in daylight (a few ms)
+~17 ms. Turning the camera by hand while it recorded (rotation from the images against the gyro,
+in six bands of rows; 8 runs at 1.4, 16, 30 and 31 ms of exposure, HD720 at 30 Hz) found the top
+row read first at 39.1-40.6 µs a row, and the image's middle row moving −0.502 ± 0.005 ms per ms
+of exposure (half the exposure: the model's), all 8 within ±0.24 ms of `mid_exposure_ns`. Other
+modes are not measured. The kernel's stamp comes 1.4 ms after the pulse, before the first row
+is read: the camera starts each frame's transfer during the blanking.
 
 Only one process may use the camera's extension unit at a time: a request and its answer are
 two calls, and another process's request between them takes the answer.

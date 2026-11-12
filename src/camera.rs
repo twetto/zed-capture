@@ -29,13 +29,26 @@ pub struct Readout {
     /// The sensor's output rows before the image's first (the camera crops the rows it does not
     /// send evenly, assumed: HD720, 724 rows to 720).
     pub rows_before_image: f64,
-    /// From the pulse to the sensor's first output row being read (ns): the frame's blanking
-    /// lines (its lines but the rows output; HD720 at 30 Hz: 108, 4.33 ms) come first. Turning
-    /// the camera by hand against the gyro (LabOrin, 2026-11-12, 29.9 ms exposure) put the
-    /// image's middle row 4.21 ms after where a pulse-to-row time of 0 put it, the top row read
-    /// first at 39.7 µs a row. The kernel stamp comes before the first row (1.1-1.7 ms after
-    /// the pulse): the camera starts each frame's transfer during the blanking.
+    /// From the pulse to the sensor's first output row being read (ns), on the IMU's clock:
+    /// [`pulse_to_readout_ns`].
     pub pulse_to_readout_ns: f64,
+}
+
+/// How much sooner than the frame's blanking the first row is read after the pulse, by the
+/// IMU's clock (ns): measured, HD720 at 30 Hz only (see [`pulse_to_readout_ns`]).
+const READOUT_BEFORE_BLANKING_ENDS_NS: f64 = 310_000.0;
+
+/// From the pulse to the sensor's first output row being read (ns), by the IMU's clock: the
+/// frame's blanking lines (its lines but the rows output; HD720 at 30 Hz: 108, 4.33 ms) come
+/// first, less 0.31 ms. Turning the camera by hand against the gyro (LabOrin's ZED 2i,
+/// 2026-11-12, HD720 at 30 Hz: 8 runs at exposures of 1.4, 16, 30 and 31 ms) put the image's
+/// middle row at the pulse + 4.02 ms + its readout − 0.502 (±0.005) × the exposure, within
+/// ±0.24 ms; the top row read first, 39.1-40.6 µs a row. Whether the 0.31 ms is the pulse coming
+/// a few lines into the blanking or a delay in the IMU's path, one mode cannot tell: other modes
+/// are not measured. The kernel stamp comes before the first row (1.1-1.7 ms after the pulse):
+/// the camera starts each frame's transfer during the blanking.
+pub fn pulse_to_readout_ns(frame_length: u16, output_height: u16, line_ns: f64) -> f64 {
+    (frame_length as f64 - output_height as f64) * line_ns - READOUT_BEFORE_BLANKING_ENDS_NS
 }
 
 impl Readout {
@@ -226,7 +239,7 @@ impl Camera {
         Some(Readout {
             line_ns,
             rows_before_image: (t.output_height as f64 - self.video.config().height as f64) / 2.0,
-            pulse_to_readout_ns: (t.frame_length as f64 - t.output_height as f64) * line_ns,
+            pulse_to_readout_ns: pulse_to_readout_ns(t.frame_length, t.output_height, line_ns),
         })
     }
 
@@ -278,10 +291,12 @@ mod tests {
         let r = Readout {
             line_ns,
             rows_before_image: 2.0,
-            pulse_to_readout_ns: 108.0 * line_ns,
+            pulse_to_readout_ns: pulse_to_readout_ns(832, 724, line_ns),
         };
+        assert!((r.pulse_to_readout_ns / 1e6 - 4.0171).abs() < 0.001);
+        // The shake runs' fit: the middle row 18.52 ms after the pulse, less half the exposure
         let ms = r.middle_row_ns(720) / 1e6;
-        assert!((ms - 18.811).abs() < 0.001, "{ms}");
+        assert!((ms - 18.501).abs() < 0.001, "{ms}");
     }
 
     #[test]
