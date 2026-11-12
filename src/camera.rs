@@ -21,12 +21,6 @@ const MARKED_EYE: usize = 0;
 const EXPOSURE_EYE: usize = 1;
 /// Frames whose arrival after the pulse is averaged before it is used.
 const ARRIVAL_FRAMES: usize = 15;
-/// From a frame's sync pulse to the sensor's first output row being read (ns). Not measured:
-/// taken as 0, the pulse being the sensor's frame start (VSYNC), and the kernel stamp coming
-/// 1.1-1.7 ms after it with the first data. The image's time against `mid_exposure_ns`, from
-/// the camera turned by hand against the gyro, measures it.
-pub const PULSE_TO_READOUT_NS: f64 = 0.0;
-
 /// When a frame's rows are read, from its sync pulse: a rolling shutter, row after row.
 #[derive(Clone, Copy, Debug)]
 pub struct Readout {
@@ -35,7 +29,12 @@ pub struct Readout {
     /// The sensor's output rows before the image's first (the camera crops the rows it does not
     /// send evenly, assumed: HD720, 724 rows to 720).
     pub rows_before_image: f64,
-    /// See [`PULSE_TO_READOUT_NS`].
+    /// From the pulse to the sensor's first output row being read (ns): the frame's blanking
+    /// lines (its lines but the rows output; HD720 at 30 Hz: 108, 4.33 ms) come first. Turning
+    /// the camera by hand against the gyro (LabOrin, 2026-11-12, 29.9 ms exposure) put the
+    /// image's middle row 4.21 ms after where a pulse-to-row time of 0 put it, the top row read
+    /// first at 39.7 µs a row. The kernel stamp comes before the first row (1.1-1.7 ms after
+    /// the pulse): the camera starts each frame's transfer during the blanking.
     pub pulse_to_readout_ns: f64,
 }
 
@@ -223,10 +222,11 @@ impl Camera {
 
     fn readout_with(&self, clock: &FrameClock) -> Option<Readout> {
         let t = self.timing.as_ref().ok()?;
+        let line_ns = clock.period_ns / t.frame_length as f64;
         Some(Readout {
-            line_ns: clock.period_ns / t.frame_length as f64,
+            line_ns,
             rows_before_image: (t.output_height as f64 - self.video.config().height as f64) / 2.0,
-            pulse_to_readout_ns: PULSE_TO_READOUT_NS,
+            pulse_to_readout_ns: (t.frame_length as f64 - t.output_height as f64) * line_ns,
         })
     }
 
@@ -272,14 +272,16 @@ mod tests {
 
     #[test]
     fn middle_row_from_the_line_time() {
-        // LabOrin's ZED 2i at HD720: 832 lines in 33.335 ms, 724 rows output for 720
+        // LabOrin's ZED 2i at HD720: 832 lines in 33.335 ms, 724 rows output for 720, after
+        // 108 lines of blanking
+        let line_ns = 33.335e6 / 832.0;
         let r = Readout {
-            line_ns: 33.335e6 / 832.0,
+            line_ns,
             rows_before_image: 2.0,
-            pulse_to_readout_ns: 0.0,
+            pulse_to_readout_ns: 108.0 * line_ns,
         };
         let ms = r.middle_row_ns(720) / 1e6;
-        assert!((ms - 14.484).abs() < 0.001, "{ms}");
+        assert!((ms - 18.811).abs() < 0.001, "{ms}");
     }
 
     #[test]

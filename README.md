@@ -54,12 +54,17 @@ exposure the camera's auto exposure set, once a frame, from the right sensor's r
 auto exposure gives both sensors the same; the left's registers often don't answer while the
 camera streams: they read 0xff or 0x00, for single reads or seconds on end), and gives each frame
 its exposure (`Frame::exposure_ns`) and the middle of the exposure of its middle row
-(`Frame::mid_exposure_ns`): the pulse, plus the readout to that row, less half the exposure,
-taking the first row to be read at the pulse. In the lab at night (31 ms exposure) that was
-1.1 ms before the pulse; in daylight (a few ms) it is ~13 ms after it. Still to be measured: the
-time from the pulse to the first row, by turning the camera (rotation from the images against
-the gyro). Only one process may use the camera's extension unit at a time: a request and its
-answer are two calls, and another process's request between them takes the answer.
+(`Frame::mid_exposure_ns`): the pulse, plus the frame's blanking lines (4.33 ms), plus the
+readout to that row, less half the exposure. In the lab at night (30 ms exposure) that is
+3.8 ms after the pulse; in daylight (a few ms) ~17 ms. Turning the camera by hand while it
+recorded (rotation from the images against the gyro, in six bands of rows) found the top row
+read first, 39.7 µs a row, and the blanking first: the image's middle
+row within 0.1-0.3 ms of `mid_exposure_ns` at a 30 ms exposure; a short exposure is still to
+be checked. The kernel's stamp comes 1.4 ms after the pulse, before the first row is read: the
+camera starts each frame's transfer during the blanking.
+
+Only one process may use the camera's extension unit at a time: a request and its answer are
+two calls, and another process's request between them takes the answer.
 
 **After the ZED SDK, the IMU comes back by itself.** The SDK detaches the kernel's driver from the
 IMU's USB interface and leaves it detached when it closes the camera, so its hidraw node is gone
