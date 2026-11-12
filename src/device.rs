@@ -2,7 +2,11 @@
 
 use std::fs;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use crate::sys;
 
 const VENDOR: u16 = 0x2b03;
 /// (video product, hidraw product, model). The original ZED has no IMU.
@@ -25,9 +29,32 @@ pub struct Devices {
 }
 
 /// The one ZED attached. Err if there is none, or more than one (then name the devices).
+///
+/// When a ZED's video is there but its hidraw node is not, the IMU's USB interface has likely lost
+/// its kernel driver to the ZED SDK, which detaches it and leaves it so when it closes the camera:
+/// this gives it back (see [`reattach_hid`]) and waits for the node.
 pub fn find() -> io::Result<Devices> {
     let videos = videos()?;
-    let hids = hids()?;
+    let mut hids = hid_nodes()?;
+    if missing_hid(&videos, &hids) && reattach_hid()? > 0 {
+        let t0 = Instant::now();
+        loop {
+            hids = hid_nodes()?;
+            // udev sets the node's mode just after it appears: wait until it opens
+            let ready = !missing_hid(&videos, &hids)
+                && hids.iter().all(|(_, path, _)| {
+                    fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(path)
+                        .is_ok()
+                });
+            if ready || t0.elapsed() > Duration::from_secs(3) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
     let mut found = Vec::new();
     for (video_product, video) in &videos {
         let Some(&(_, hid_product, model)) = MODELS.iter().find(|m| m.0 == *video_product) else {
@@ -61,6 +88,106 @@ pub fn find() -> io::Result<Devices> {
     }
 }
 
+/// A ZED's video whose IMU has no hidraw node.
+fn missing_hid(videos: &[(u16, PathBuf)], hids: &[(u16, PathBuf, Option<String>)]) -> bool {
+    videos.iter().any(|(video_product, _)| {
+        MODELS
+            .iter()
+            .find(|m| m.0 == *video_product)
+            .is_some_and(|m| !hids.iter().any(|h| h.0 == m.1))
+    })
+}
+
+/// `struct usbdevfs_ioctl` (linux/usbdevice_fs.h).
+#[repr(C)]
+struct UsbdevfsIoctl {
+    ifno: libc::c_int,
+    ioctl_code: libc::c_int,
+    data: *mut libc::c_void,
+}
+
+const USBDEVFS_IOCTL: libc::c_ulong =
+    sys::ioc(sys::READ | sys::WRITE, b'U', 18, size_of::<UsbdevfsIoctl>());
+const USBDEVFS_CONNECT: libc::c_ulong = sys::ioc(0, b'U', 23, 0);
+
+/// Gives every ZED IMU interface without a kernel driver back to the kernel (usbhid, which makes
+/// its hidraw node), as libusb's `libusb_attach_kernel_driver` does. The ZED SDK detaches the
+/// driver to talk to the IMU itself and does not attach it again when it closes the camera; until
+/// then, or a replug, there is no hidraw node. Needs write access to the camera's
+/// `/dev/bus/usb/BBB/DDD` node, which Stereolabs' udev rule (`99-slabs.rules`) gives everyone.
+/// Returns how many interfaces it gave back.
+pub fn reattach_hid() -> io::Result<usize> {
+    let mut done = 0;
+    let Ok(entries) = fs::read_dir("/sys/bus/usb/devices") else {
+        return Ok(0);
+    };
+    for entry in entries {
+        let dev = entry?.path();
+        if read_hex(&dev.join("idVendor")) != Some(VENDOR)
+            || !read_hex(&dev.join("idProduct")).is_some_and(|p| MODELS.iter().any(|m| m.1 == p))
+        {
+            continue;
+        }
+        let name = dev.file_name().unwrap().to_string_lossy().into_owned();
+        // Its interfaces: <device>:<configuration>.<interface>
+        for intf in fs::read_dir(&dev)? {
+            let intf = intf?.path();
+            let is_interface = intf
+                .file_name()
+                .is_some_and(|f| f.to_string_lossy().starts_with(&format!("{name}:")));
+            if !is_interface
+                || read_hex(&intf.join("bInterfaceClass")) != Some(0x03)
+                || intf.join("driver").exists()
+            {
+                continue;
+            }
+            let Some(ifno) = read_hex(&intf.join("bInterfaceNumber")) else {
+                continue;
+            };
+            let number = |f: &str| -> io::Result<u32> {
+                fs::read_to_string(dev.join(f))?
+                    .trim()
+                    .parse()
+                    .map_err(|_| {
+                        io::Error::other(format!("{}: not a number", dev.join(f).display()))
+                    })
+            };
+            let node = format!(
+                "/dev/bus/usb/{:03}/{:03}",
+                number("busnum")?,
+                number("devnum")?
+            );
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&node)
+                .map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "the ZED's IMU has no kernel driver (the ZED SDK detached it), and {node} \
+                             can't be opened to attach it again ({e}): replug the camera, or install \
+                             Stereolabs' udev rules"
+                        ),
+                    )
+                })?;
+            let mut request = UsbdevfsIoctl {
+                ifno: ifno.into(),
+                ioctl_code: USBDEVFS_CONNECT as libc::c_int,
+                data: std::ptr::null_mut(),
+            };
+            sys::ioctl(file.as_raw_fd(), USBDEVFS_IOCTL, &mut request).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("attaching the kernel's driver to the ZED's IMU ({node}): {e}"),
+                )
+            })?;
+            done += 1;
+        }
+    }
+    Ok(done)
+}
+
 fn read_hex(path: &Path) -> Option<u16> {
     u16::from_str_radix(fs::read_to_string(path).ok()?.trim(), 16).ok()
 }
@@ -87,7 +214,7 @@ fn videos() -> io::Result<Vec<(u16, PathBuf)>> {
 }
 
 /// (product, /dev/hidrawN, serial) of each Stereolabs hidraw node.
-fn hids() -> io::Result<Vec<(u16, PathBuf, Option<String>)>> {
+fn hid_nodes() -> io::Result<Vec<(u16, PathBuf, Option<String>)>> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir("/sys/class/hidraw") else {
         return Ok(out);

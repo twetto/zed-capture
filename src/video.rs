@@ -223,7 +223,8 @@ pub struct VideoStats {
     pub missing_by_time: u64,
     /// Frames dropped from a full ring: the reader was late.
     pub ring_drops: u64,
-    /// Buffers with the error flag or the wrong size.
+    /// Buffers with the error flag or the wrong size. A ZED 2i returns one per buffer right after
+    /// STREAMON, stamped 0; they count neither as frames missing by time nor in the longest interval.
     pub bad_buffers: u64,
     /// The longest time between two frames' timestamps.
     pub longest_interval_ns: u64,
@@ -526,7 +527,10 @@ impl Capture {
     fn capture(&self) -> io::Result<()> {
         let frame_bytes = self.eye_width * 2 * 2 * self.height;
         let eye_bytes = self.eye_width * self.height;
-        let mut last: Option<(u32, u64)> = None;
+        // The previous buffer's sequence number, and the previous timestamp. The buffers that come
+        // back bad right after STREAMON (one per buffer on a ZED 2i) are stamped 0: no time.
+        let mut last_sequence: Option<u32> = None;
+        let mut last_time: Option<u64> = None;
         let mut last_good = Instant::now();
         while !self.shared.stop.load(Ordering::Relaxed) {
             if last_good.elapsed() > STALL {
@@ -592,15 +596,20 @@ impl Capture {
                 if !good {
                     s.bad_buffers += 1;
                 }
-                if let Some((seq, t)) = last {
+                if let Some(seq) = last_sequence {
                     s.missing_by_sequence += sequence.wrapping_sub(seq).saturating_sub(1) as u64;
+                }
+                if let (Some(t), true) = (last_time, timestamp_ns > 0) {
                     let dt = timestamp_ns.saturating_sub(t);
                     s.longest_interval_ns = s.longest_interval_ns.max(dt);
                     let periods = (dt as f64 / self.period_ns).round() as u64;
                     s.missing_by_time += periods.saturating_sub(1);
                 }
             }
-            last = Some((sequence, timestamp_ns));
+            last_sequence = Some(sequence);
+            if timestamp_ns > 0 {
+                last_time = Some(timestamp_ns);
+            }
             if good {
                 last_good = Instant::now();
                 self.shared.started.store(true, Ordering::Release);

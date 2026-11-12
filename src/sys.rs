@@ -64,5 +64,8 @@ mod tests {
         assert_eq!(ioc(READ, b'V', 0, 104), 0x8068_5600);
         assert_eq!(ioc(READ | WRITE, b'V', 17, 88), 0xc058_5611);
         assert_eq!(ioc(READ | WRITE, b'H', 0x06, 2), 0xc002_4806);
+        // USBDEVFS_IOCTL on 64-bit, USBDEVFS_CONNECT
+        assert_eq!(ioc(READ | WRITE, b'U', 18, 16), 0xc010_5512);
+        assert_eq!(ioc(0, b'U', 23, 0), 0x5517);
     }
 }

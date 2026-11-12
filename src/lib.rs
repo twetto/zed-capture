@@ -8,7 +8,8 @@
 //!   camera MCU's clock to count samples lost on the way.
 //! - [`Camera`]: both, started in the order that works (the IMU after the first frame), each
 //!   frame with the IMU samples read up to its timestamp.
-//! - [`find`]: the camera's video and hidraw devices, from sysfs.
+//! - [`find`]: the camera's video and hidraw devices, from sysfs; it gives the IMU back to the
+//!   kernel when the ZED SDK left it detached ([`reattach_hid`]).
 //!
 //! The USB protocol (report layout, scales, the stream and ping requests) follows Stereolabs'
 //! zed-open-capture (MIT). Unlike it and the SDK, nothing here keeps only the newest frame or
@@ -21,7 +22,7 @@ mod sys;
 pub mod video;
 
 pub use camera::Camera;
-pub use device::{Devices, find};
+pub use device::{Devices, find, reattach_hid};
 pub use imu::{Imu, ImuSample, ImuStats};
 pub use video::{Frame, Video, VideoConfig, VideoStats};
 

@@ -31,6 +31,14 @@ while let Some((frame, imu)) = camera.next(Duration::from_secs(1))? {
 the IMU's stream on before the video's, or just after it, makes the video return empty buffers
 with the error flag, and then stop.
 
+**After the ZED SDK, the IMU comes back by itself.** The SDK detaches the kernel's driver from the
+IMU's USB interface and leaves it detached when it closes the camera, so its hidraw node is gone
+until a replug. `find` attaches the driver again (as libusb's `libusb_attach_kernel_driver`),
+through the camera's `/dev/bus/usb` node, which Stereolabs' udev rule makes writable.
+
+The first buffers after the video starts (one per buffer on a ZED 2i) come back empty, stamped
+0: they count as bad buffers, not as lost frames.
+
 ## The loss counter
 
 ```
@@ -39,6 +47,13 @@ zed_count [--seconds 60] [--work-ms 30] [--hogs 6] [--no-imu]
 
 It reports frames and IMU samples missing, ring drops (a late reader), the longest gaps, and
 how long splitting a frame takes.
+
+```
+zed_grab OUT [--frames 5] [--every 15] [--skip 3]
+```
+
+It saves raw left and right grey as PGM files, named by timestamp, and the camera's serial
+number, which names its factory calibration (`/usr/local/zed/settings/SN<serial>.conf`).
 
 ## Building for a Jetson (JetPack 6)
 
