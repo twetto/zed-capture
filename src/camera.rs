@@ -15,12 +15,9 @@ const MIN_MARKS: usize = 30;
 const MAX_SINCE_MARK_NS: f64 = 1e9;
 /// The sensor whose pulses the MCU marks: the left (see [`Video::enable_frame_sync`]).
 const MARKED_EYE: usize = 0;
-/// The sensor whose exposure is read: the right. The left's registers often do not answer
-/// ([`crate::sensor`]). The camera's auto exposure runs for each eye apart, but close (LabOrin:
-/// the same or 2-30 lines apart, the left 779 and the right 747 for 4 s after the stream
-/// started; at most ~0.6 ms off the left's middle of exposure); a manual exposure
-/// ([`Video::set_manual_exposure`]) is the same on both.
-const EXPOSURE_EYE: usize = 1;
+/// The sensor whose timing registers are read first: the right, which always answered (the
+/// left's often do not: [`crate::sensor`]).
+const TIMING_EYE: usize = 1;
 /// Frames whose arrival after the pulse is averaged before it is used.
 const ARRIVAL_FRAMES: usize = 15;
 /// When a frame's rows are read, from its sync pulse: a rolling shutter, row after row.
@@ -137,8 +134,8 @@ impl Camera {
         };
         let sensors = video.sensors();
         let timing = sensors
-            .timing(EXPOSURE_EYE, Duration::from_secs(1))
-            .or_else(|_| sensors.timing(1 - EXPOSURE_EYE, Duration::from_secs(1)))
+            .timing(TIMING_EYE, Duration::from_secs(1))
+            .or_else(|_| sensors.timing(1 - TIMING_EYE, Duration::from_secs(1)))
             .map_err(|e| format!("the sensors' timing: {e}"))
             .and_then(|t| {
                 if !(1..4096).contains(&t.frame_length)
@@ -152,7 +149,6 @@ impl Camera {
         let exposure = match &timing {
             Ok(t) => Some(ExposureMonitor::start(
                 sensors.clone(),
-                EXPOSURE_EYE,
                 Duration::from_secs_f64(1.0 / video.fps()),
                 t.frame_length as u32,
             )?),
@@ -186,14 +182,18 @@ impl Camera {
     /// Before that (the first ~3 s: the MCU clock's rate takes two seconds), without marks, and
     /// over a second after the newest mark, the samples read up to the frame's kernel stamp.
     ///
-    /// With its pulse, the frame gets the exposure ([`crate::Frame::exposure_ns`]) and the
-    /// middle of the exposure of the image's middle row ([`crate::Frame::mid_exposure_ns`]):
-    /// the pulse, plus the readout to that row ([`Readout`]), less half the exposure. The
-    /// exposure is the right sensor's (taken for both: see [`Frame::exposure_ns`](crate::Frame::exposure_ns)), its registers'
-    /// newest answer (read once a frame, in a thread of its own) from before the previous
-    /// frame's pulse, and at most 1 s before: OmniVision's sensors take a new exposure at a
-    /// frame's start, for the frame after. While the auto exposure changes, it may be a frame
-    /// off; [`Camera::drain_exposure`] has every reading.
+    /// With its pulse, the frame gets each eye's exposure ([`crate::Frame::exposure_ns`]) and the
+    /// middle of the exposure of each eye's middle row ([`crate::Frame::mid_exposure_ns`]): the
+    /// pulse, plus the readout to that row ([`Readout`]), less half the eye's exposure. The
+    /// pulse is the left sensor's; the right's rows are read with the left's (one shake run on
+    /// both eyes: each middle row within 0.06 ms of its stamp). An eye's exposure is the manual one
+    /// ([`Video::set_manual_exposure`]) if it was set before the previous frame's pulse, else
+    /// its sensor's newest answer to the readings of its registers (both read once a frame, in a
+    /// thread of its own) from before the previous frame's pulse, and at most 1 s before:
+    /// OmniVision's sensors take a new exposure at a frame's start, for the frame after. While
+    /// the auto exposure changes, it may be a frame off; [`Camera::drain_exposure`] has every
+    /// reading. The left sensor often does not answer for a second or more: its exposure is then
+    /// None (the right's is close, but can be up to ~5 ms apart).
     pub fn next(&self, timeout: Duration) -> io::Result<Option<(crate::Frame, Vec<ImuSample>)>> {
         let Some(mut frame) = self.video.next(timeout)? else {
             return Ok(None);
@@ -207,13 +207,22 @@ impl Camera {
         {
             frame.sync_time_ns = Some(time);
             frame.mcu_frame_count = Some(count);
-            if let Some(readout) = self.readout_with(&clock)
-                && let Some(lines) = self.exposure_at(time as f64 - clock.period_ns)
-            {
-                let e = (lines as f64 * readout.line_ns).round();
-                frame.exposure_ns = Some(e as u32);
-                let mid = time as f64 + readout.middle_row_ns(frame.height) - e / 2.0;
-                frame.mid_exposure_ns = Some(mid.round() as u64);
+            if let Some(readout) = self.readout_with(&clock) {
+                // The exposure in force: set before the previous frame's pulse
+                let set_by = time as f64 - clock.period_ns;
+                let exposure = match self
+                    .video
+                    .manual_exposure()
+                    .filter(|m| (m.since_ns as f64) < set_by)
+                {
+                    Some(m) => [Some(m.lines as f64 * readout.line_ns); 2],
+                    None => self
+                        .exposure_at(set_by)
+                        .map(|l| l.map(|l| l as f64 * readout.line_ns)),
+                };
+                let middle = time as f64 + readout.middle_row_ns(frame.height);
+                frame.exposure_ns = exposure.map(|e| e.map(|e| e.round() as u32));
+                frame.mid_exposure_ns = exposure.map(|e| e.map(|e| (middle - e / 2.0).round() as u64));
             }
             let samples = imu.drain_until_time(time)?;
             return Ok(Some((frame, samples)));
@@ -231,8 +240,11 @@ impl Camera {
         (time > 0.0).then(|| (time as u64, clock.count.wrapping_add(frames as u32)))
     }
 
-    fn exposure_at(&self, time_ns: f64) -> Option<f32> {
-        self.exposure.as_ref()?.at(time_ns.max(0.0) as u64)
+    fn exposure_at(&self, time_ns: f64) -> [Option<f32>; 2] {
+        match &self.exposure {
+            Some(m) => m.at(time_ns.max(0.0) as u64),
+            None => [None; 2],
+        }
     }
 
     fn readout_with(&self, clock: &FrameClock) -> Option<Readout> {
@@ -257,8 +269,7 @@ impl Camera {
         self.timing.as_ref().copied().map_err(|e| e.as_str())
     }
 
-    /// The right sensor's exposure readings since the last call (up to 4096 kept), oldest
-    /// first.
+    /// Both sensors' exposure readings since the last call (up to 4096 kept), oldest first.
     pub fn drain_exposure(&self) -> Vec<ExposureReading> {
         self.exposure.as_ref().map(|m| m.drain()).unwrap_or_default()
     }

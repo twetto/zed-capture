@@ -242,15 +242,15 @@ pub struct Frame {
     pub sync_time_ns: Option<u64>,
     /// The MCU's count of this frame, with `sync_time_ns`.
     pub mcu_frame_count: Option<u32>,
-    /// The exposure (ns), with `sync_time_ns`: the right sensor's, taken for both. The camera's
-    /// auto exposure runs for each eye apart, but close (LabOrin: the same or 2-30 lines, up to
-    /// 1.2 ms, apart); a manual one ([`Video::set_manual_exposure`]) is the same on both.
+    /// Each eye's exposure (ns; left, right), with `sync_time_ns`: the camera's auto exposure
+    /// runs for each eye apart (LabOrin: the same to 123 lines, 4.9 ms, apart). None for an eye
+    /// whose sensor has not answered for a second (the left's often does not):
     /// [`Camera::next`](crate::Camera::next) says which reading.
-    pub exposure_ns: Option<u32>,
-    /// The middle of the exposure of the image's middle row (host ns), with `exposure_ns`: see
-    /// [`Camera::next`](crate::Camera::next). Rolling shutter: the other rows' come up to half a
-    /// readout (HD720: 14.5 ms) before and after it.
-    pub mid_exposure_ns: Option<u64>,
+    pub exposure_ns: [Option<u32>; 2],
+    /// The middle of the exposure of each eye's image's middle row (host ns), with its
+    /// `exposure_ns`: see [`Camera::next`](crate::Camera::next). Rolling shutter: the other
+    /// rows' come up to half a readout (HD720: 14.5 ms) before and after it.
+    pub mid_exposure_ns: [Option<u64>; 2],
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
@@ -321,8 +321,10 @@ pub struct Video {
     _maps: Arc<Vec<Mapping>>,
     file: File,
     sensors: Sensors,
+    /// The manual exposure set here, if any.
+    manual: Mutex<Option<ManualExposure>>,
     /// The camera's auto exposure was turned off here: turned back on when dropped.
-    manual: AtomicBool,
+    turned_auto_off: AtomicBool,
 }
 
 /// A manual exposure as set ([`Video::set_manual_exposure`]).
@@ -336,6 +338,8 @@ pub struct ManualExposure {
     pub line_ns: f64,
     /// The gain both sensors have (raw).
     pub gain: [Option<u16>; 2],
+    /// `CLOCK_MONOTONIC` ns when both sensors had it.
+    pub since_ns: u64,
 }
 
 /// The longest manual exposure: the frame's lines less these (800 at HD720, tried at 30 Hz with
@@ -492,7 +496,8 @@ impl Video {
             _maps: maps,
             sensors: Sensors::new(file.try_clone()?),
             file,
-            manual: AtomicBool::new(false),
+            manual: Mutex::new(None),
+            turned_auto_off: AtomicBool::new(false),
         })
     }
 
@@ -635,8 +640,15 @@ impl Video {
     pub fn set_auto_exposure(&self) -> io::Result<()> {
         self.sensors.set_auto_exposure(0, true)?;
         self.sensors.set_auto_exposure(1, true)?;
-        self.manual.store(false, Ordering::Relaxed);
+        *self.manual.lock().unwrap() = None;
+        self.turned_auto_off.store(false, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// The manual exposure set by [`Video::set_manual_exposure`], until the auto exposure is
+    /// back on.
+    pub fn manual_exposure(&self) -> Option<ManualExposure> {
+        *self.manual.lock().unwrap()
     }
 
     /// A manual exposure, the same on both sensors, as zed-open-capture sets it: the camera's
@@ -661,7 +673,8 @@ impl Video {
         let max = (timing.frame_length as u32).saturating_sub(EXPOSURE_MARGIN_LINES);
         let lines = ((exposure.as_nanos() as f64 / line_ns).round() as u32).clamp(1, max);
         let was_on = self.auto_exposure()?;
-        self.manual.store(true, Ordering::Relaxed);
+        *self.manual.lock().unwrap() = None;
+        self.turned_auto_off.store(true, Ordering::Relaxed);
         for eye in 0..2 {
             self.sensors.set_auto_exposure(eye, false)?;
         }
@@ -677,18 +690,21 @@ impl Video {
                 self.sensors.set_gain(eye, g, wait).map_err(what)?;
             }
         }
-        Ok(ManualExposure {
+        let m = ManualExposure {
             lines,
             exposure_ns: lines as f64 * line_ns,
             line_ns,
             gain: [self.sensors.gain(0)?, self.sensors.gain(1)?],
-        })
+            since_ns: crate::monotonic_ns(),
+        };
+        *self.manual.lock().unwrap() = Some(m);
+        Ok(m)
     }
 }
 
 impl Drop for Video {
     fn drop(&mut self) {
-        if self.manual.load(Ordering::Relaxed) {
+        if self.turned_auto_off.load(Ordering::Relaxed) {
             let _ = self.set_auto_exposure();
         }
         self.shared.stop.store(true, Ordering::Relaxed);
@@ -779,8 +795,8 @@ impl Capture {
                     right,
                     sync_time_ns: None,
                     mcu_frame_count: None,
-                    exposure_ns: None,
-                    mid_exposure_ns: None,
+                    exposure_ns: [None; 2],
+                    mid_exposure_ns: [None; 2],
                     pool: self.pool.clone(),
                 })
             } else {

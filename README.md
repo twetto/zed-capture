@@ -14,8 +14,7 @@ Why: the ZED SDK keeps only the newest frame and the newest IMU sample. Under lo
 Orin Nano it lost 2-4 % of frames and up to 6 % of IMU samples, while V4L2 alone lost none. See
 mr-neuro-nav's `docs/idog/2026-11-03-30hz-recording-plan.md`.
 
-What it doesn't do: the SDK's depth, tracking or rectification. Exposure and gain stay on the
-camera's auto settings (they are read, not set).
+What it doesn't do: the SDK's depth, tracking or rectification.
 
 ```rust
 use std::time::Duration;
@@ -49,21 +48,33 @@ frame got its pulse; each frame's kernel stamp came 1.1-1.7 ms after it, and pul
 33.335 ms (p10-p90 ±20 µs).
 
 **When the image was exposed.** The sensors (OmniVision OV4689s) have a rolling shutter: HD720 at
-30 Hz is 832 lines of 40.07 µs a frame, the image's 720 rows read over 29 ms. `Camera` reads the
-exposure, once a frame, from the right sensor's registers (the camera's auto exposure runs for
-each eye apart but close, the same or up to ~30 lines apart; the left's registers often don't
-answer while the camera streams: they read 0xff or 0x00, for single reads or seconds on end),
-and gives each frame
-its exposure (`Frame::exposure_ns`) and the middle of the exposure of its middle row
+30 Hz is 832 lines of 40.07 µs a frame, the image's 720 rows read over 29 ms. `Camera` reads both
+sensors' exposure registers once a frame and gives each frame each eye's exposure
+(`Frame::exposure_ns`) and the middle of the exposure of its image's middle row
 (`Frame::mid_exposure_ns`): the pulse, plus 4.02 ms to the first row (the frame's blanking
-lines, 4.33 ms, less 0.31 ms measured), plus the readout to that row, less half the exposure.
+lines, 4.33 ms, less 0.31 ms measured), plus the readout to that row, less half the eye's
+exposure. The camera's auto exposure runs for each eye apart: seen from the same to 123 lines
+(4.9 ms) apart. The left sensor's registers often don't answer while the camera streams (they
+read 0xff or 0x00, for single reads or seconds on end; the right's always answered): its
+exposure is its newest answer up to a second old, else none. The camera's ISP keeps no copy of
+it in its registers that we found.
 In the lab at night (30 ms exposure) that is 3.5 ms after the pulse; in daylight (a few ms)
 ~17 ms. Turning the camera by hand while it recorded (rotation from the images against the gyro,
 in six bands of rows; 8 runs at 1.4, 16, 30 and 31 ms of exposure, HD720 at 30 Hz) found the top
 row read first at 39.1-40.6 µs a row, and the image's middle row moving −0.502 ± 0.005 ms per ms
-of exposure (half the exposure: the model's), all 8 within ±0.24 ms of `mid_exposure_ns`. Other
-modes are not measured. The kernel's stamp comes 1.4 ms after the pulse, before the first row
+of exposure (half the exposure: the model's), all 8 within ±0.24 ms of the left's
+`mid_exposure_ns`. One run analysed on both eyes (24.88 ms): the left's middle row −0.06 ms and
+the right's −0.03 ms from their stamps, 39.75 and 39.63 µs a row: the sensors read out together.
+Other modes are not measured. The kernel's stamp comes 1.4 ms after the pulse, before the first row
 is read: the camera starts each frame's transfer during the blanking.
+
+**Exposure by hand, and the mains.** `Video::set_manual_exposure` sets an exposure (ms, as whole
+lines) and a raw gain on both sensors as zed-open-capture does: the camera's auto exposure off in
+each eye's ISP (an OmniVision OV580), 5 frames' wait, each sensor written and checked; frames
+then carry that exposure exactly. The auto exposure comes back on when the video is dropped (or
+on a replug, if the process dies first). `VideoConfig::mains_hz` sets the camera's anti-flicker:
+its auto exposure then keeps to whole periods of the lights' flicker. The camera powers up at
+50 Hz; in Taiwan (60 Hz) that gave 29.93 ms at night against 24.88 ms at 60 Hz.
 
 Only one process may use the camera's extension unit at a time: a request and its answer are
 two calls, and another process's request between them takes the answer.
@@ -86,14 +97,16 @@ It reports frames and IMU samples missing, ring drops (a late reader), the longe
 how long splitting a frame takes.
 
 ```
-zed_grab OUT [--frames 5] [--every 15] [--skip 3] [--left-only] [--imu]
+zed_grab OUT [--frames 5] [--every 15] [--skip 3] [--left-only] [--imu] [--mains 50|60]
+         [--exposure-ms MS [--gain RAW]]
 ```
 
 It saves raw left and right grey as PGM files, named by timestamp, and the camera's serial
 number, which names its factory calibration (`/usr/local/zed/settings/SN<serial>.conf`). With
-`--imu`, `frames.csv` (each frame's kernel stamp, sync pulse, MCU count, exposure and
-mid-exposure), `imu.csv` (every sample), `exposure.csv` (every reading of the exposure) and
-`readout.csv` (the line time).
+`--imu`, `frames.csv` (each frame's kernel stamp, sync pulse, MCU count, and each eye's exposure
+and mid-exposure), `imu.csv` (every sample), `exposure.csv` (every reading of both exposures) and
+`readout.csv` (the line time). `--exposure-ms` and `--gain` set a manual exposure for the run;
+`--mains` the anti-flicker (`zed_count` takes it too).
 
 `zed_count` also checks the frame sync: how steady each frame's arrival after its pulse is,
 pulse to pulse, the marks against the fitted pulses, and the exposure and mid-exposure.

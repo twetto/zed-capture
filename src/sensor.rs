@@ -355,23 +355,23 @@ fn exposure_from(mid: u32, low: u32, max_lines: u32) -> Option<u32> {
     (16..=max_lines * 16).contains(&v).then_some(v)
 }
 
-/// A reading of a sensor's exposure.
+/// A reading of both sensors' exposure.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExposureReading {
-    /// `CLOCK_MONOTONIC` ns: when the reading began.
+    /// `CLOCK_MONOTONIC` ns: when the reading began (the left's).
     pub time_ns: u64,
-    /// How long it took (ns).
+    /// How long both took (ns).
     pub read_ns: u32,
-    /// In lines; None when the sensor did not answer.
-    pub lines: Option<f32>,
+    /// Per eye, in lines; None when the sensor did not answer.
+    pub lines: [Option<f32>; 2],
 }
 
 /// Counts since the monitor started.
 #[derive(Clone, Debug, Default)]
 pub struct ExposureStats {
     pub readings: u64,
-    /// Readings the sensor did not answer (see the module's note).
-    pub unanswered: u64,
+    /// Per eye, readings the sensor did not answer (see the module's note).
+    pub unanswered: [u64; 2],
     /// Readings that failed with an error.
     pub failures: u64,
     pub last_error: Option<String>,
@@ -384,7 +384,7 @@ pub struct ExposureStats {
 const HISTORY: usize = 64;
 /// Readings kept for [`ExposureMonitor::drain`] when nobody drains them.
 const LOG_LIMIT: usize = 4096;
-/// The oldest reading a frame takes (ns): longer than the left sensor's spans without answers.
+/// The oldest answer a frame takes (ns).
 const STALE_NS: u64 = 1_000_000_000;
 
 #[derive(Default)]
@@ -394,7 +394,7 @@ struct MonitorShared {
     stats: ExposureStats,
 }
 
-/// A thread reading a sensor's exposure once per `period`, until dropped.
+/// A thread reading both sensors' exposure once per `period`, until dropped.
 pub(crate) struct ExposureMonitor {
     shared: Arc<Mutex<MonitorShared>>,
     stop: Arc<AtomicBool>,
@@ -405,7 +405,6 @@ impl ExposureMonitor {
     /// `max_lines`: the sensor's lines per frame; a longer exposure is a misread.
     pub(crate) fn start(
         sensors: Sensors,
-        eye: usize,
         period: Duration,
         max_lines: u32,
     ) -> io::Result<ExposureMonitor> {
@@ -418,7 +417,9 @@ impl ExposureMonitor {
                 let mut next = Instant::now();
                 while !st.load(Ordering::Relaxed) {
                     let t0 = monotonic_ns();
-                    let read = sensors.exposure_16ths(eye, max_lines);
+                    let read = sensors.exposure_16ths(0, max_lines).and_then(|l| {
+                        Ok([l, sensors.exposure_16ths(1, max_lines)?])
+                    });
                     let read_ns = monotonic_ns() - t0;
                     let mut m = s.lock().unwrap();
                     match read {
@@ -426,9 +427,11 @@ impl ExposureMonitor {
                             let reading = ExposureReading {
                                 time_ns: t0,
                                 read_ns: read_ns.min(u32::MAX as u64) as u32,
-                                lines: sixteenths.map(|v| v as f32 / 16.0),
+                                lines: sixteenths.map(|v| v.map(|v| v as f32 / 16.0)),
                             };
-                            m.stats.unanswered += sixteenths.is_none() as u64;
+                            for (eye, v) in sixteenths.iter().enumerate() {
+                                m.stats.unanswered[eye] += v.is_none() as u64;
+                            }
                             if m.history.len() == HISTORY {
                                 m.history.pop_front();
                             }
@@ -463,10 +466,11 @@ impl ExposureMonitor {
         })
     }
 
-    /// The exposure (lines) from the newest answer begun at or before `time_ns`, and at most a
-    /// second before.
-    pub(crate) fn at(&self, time_ns: u64) -> Option<f32> {
-        newest_answer(&self.shared.lock().unwrap().history, time_ns)
+    /// Each sensor's exposure (lines) from its newest answer begun at or before `time_ns`, and
+    /// at most a second before.
+    pub(crate) fn at(&self, time_ns: u64) -> [Option<f32>; 2] {
+        let m = self.shared.lock().unwrap();
+        [0, 1].map(|eye| newest_answer(&m.history, eye, time_ns))
     }
 
     pub(crate) fn drain(&self) -> Vec<ExposureReading> {
@@ -478,15 +482,15 @@ impl ExposureMonitor {
     }
 }
 
-/// The newest answer in `history` (oldest first) begun at or before `time_ns`, and at most
+/// `eye`'s newest answer in `history` (oldest first) begun at or before `time_ns`, and at most
 /// `STALE_NS` before.
-fn newest_answer(history: &VecDeque<ExposureReading>, time_ns: u64) -> Option<f32> {
+fn newest_answer(history: &VecDeque<ExposureReading>, eye: usize, time_ns: u64) -> Option<f32> {
     history
         .iter()
         .rev()
         .skip_while(|r| r.time_ns > time_ns)
         .take_while(|r| r.time_ns + STALE_NS >= time_ns)
-        .find_map(|r| r.lines)
+        .find_map(|r| r.lines[eye])
 }
 
 impl Drop for ExposureMonitor {
@@ -516,26 +520,30 @@ mod tests {
     }
 
     #[test]
-    fn the_newest_answer() {
-        let r = |ms: u64, lines: Option<f32>| ExposureReading {
+    fn each_eye_from_its_newest_answer() {
+        let r = |ms: u64, l: Option<f32>, r: Option<f32>| ExposureReading {
             time_ns: ms * 1_000_000,
             read_ns: 0,
-            lines,
+            lines: [l, r],
         };
         let h: VecDeque<_> = [
-            r(0, Some(779.0)),
-            r(33, Some(747.0)),
-            r(67, None),
-            r(100, Some(740.0)),
+            r(0, Some(498.0), Some(621.0)),
+            r(33, None, Some(620.0)),
+            r(67, None, None),
+            r(100, Some(500.0), Some(619.0)),
         ]
         .into();
-        assert_eq!(newest_answer(&h, 80_000_000), Some(747.0));
-        assert_eq!(newest_answer(&h, 100_000_000), Some(740.0));
-        assert_eq!(newest_answer(&h, 0), Some(779.0));
+        let at = |t: u64| [0, 1].map(|eye| newest_answer(&h, eye, t * 1_000_000));
+        assert_eq!(at(80), [Some(498.0), Some(620.0)]);
+        assert_eq!(at(100), [Some(500.0), Some(619.0)]);
+        assert_eq!(at(0), [Some(498.0), Some(621.0)]);
         // Nothing before the first reading, nothing over a second old
-        assert_eq!(newest_answer(&[r(10, Some(1.0))].into(), 9_000_000), None);
-        let late: VecDeque<_> = [r(1, Some(1.0)), r(5, None)].into();
-        assert_eq!(newest_answer(&late, 1_002_000_000), None);
-        assert_eq!(newest_answer(&late, 1_000_500_000), Some(1.0));
+        assert_eq!(newest_answer(&h, 0, 0) , Some(498.0));
+        let late: VecDeque<_> = [r(1, Some(1.0), Some(2.0)), r(5, None, Some(3.0))].into();
+        assert_eq!(newest_answer(&late, 0, 1_002_000_000), None);
+        assert_eq!(newest_answer(&late, 1, 1_002_000_000), Some(3.0));
+        assert_eq!(newest_answer(&late, 0, 1_000_500_000), Some(1.0));
+        let one: VecDeque<_> = [r(10, Some(1.0), Some(1.0))].into();
+        assert_eq!(newest_answer(&one, 0, 9_000_000), None);
     }
 }

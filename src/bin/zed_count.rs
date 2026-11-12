@@ -288,10 +288,11 @@ fn run() -> Result<(), String> {
     }
     if let Some(e) = camera.exposure_stats() {
         println!(
-            "exposure (the right sensor's): read {} times ({:.1}/s since opening), not answered {}, {} failed{}; a read {:.2} ms on average, at most {:.2} ms; line {}",
+            "exposure: read {} times ({:.1}/s since opening), not answered by the left {} and the right {}, {} failed{}; both read {:.2} ms on average, at most {:.2} ms; line {}",
             e.readings,
             e.readings as f64 / (a.skip + a.seconds),
-            e.unanswered,
+            e.unanswered[0],
+            e.unanswered[1],
             e.failures,
             e.last_error
                 .map(|m| format!(" (last: {m})"))
@@ -345,12 +346,14 @@ struct SyncCheck {
     pulses: std::collections::HashMap<u32, u64>,
     pending_marks: Vec<(u32, u64)>,
     prev: Option<(u32, u64, u32)>,
-    /// Each frame's exposure.
-    exposure: Vec<i64>,
-    /// Frames with a pulse and without an exposure.
-    exposure_missing: u64,
-    /// Mid-exposure − pulse.
-    mid_after_pulse: Vec<i64>,
+    /// Per eye, each frame's exposure.
+    exposure: [Vec<i64>; 2],
+    /// Per eye, frames with a pulse and without an exposure.
+    exposure_missing: [u64; 2],
+    /// Per eye, mid-exposure − pulse.
+    mid_after_pulse: [Vec<i64>; 2],
+    /// Right's exposure − left's, when both.
+    eye_difference: Vec<i64>,
 }
 
 impl SyncCheck {
@@ -368,12 +371,17 @@ impl SyncCheck {
         };
         self.synced += 1;
         self.arrival.push(frame.timestamp_ns as i64 - t as i64);
-        match frame.exposure_ns {
-            Some(e) => self.exposure.push(e as i64),
-            None => self.exposure_missing += 1,
+        for eye in 0..2 {
+            match frame.exposure_ns[eye] {
+                Some(e) => self.exposure[eye].push(e as i64),
+                None => self.exposure_missing[eye] += 1,
+            }
+            if let Some(mid) = frame.mid_exposure_ns[eye] {
+                self.mid_after_pulse[eye].push(mid as i64 - t as i64);
+            }
         }
-        if let Some(mid) = frame.mid_exposure_ns {
-            self.mid_after_pulse.push(mid as i64 - t as i64);
+        if let [Some(l), Some(r)] = frame.exposure_ns {
+            self.eye_difference.push(r as i64 - l as i64);
         }
         if let Some((seq, pt, pcount)) = self.prev
             && frame.sequence.wrapping_sub(seq) == 1
@@ -395,15 +403,21 @@ impl SyncCheck {
     }
 
     fn report_exposure(&mut self) {
+        for (eye, name) in ["left", "right"].iter().enumerate() {
+            println!(
+                "  {name}: {} frames with an exposure, {} with a pulse and none; exposure {}",
+                self.exposure[eye].len(),
+                self.exposure_missing[eye],
+                quantiles(&mut self.exposure[eye])
+            );
+            println!(
+                "  {name}: middle row's mid-exposure after the pulse {}",
+                quantiles(&mut self.mid_after_pulse[eye])
+            );
+        }
         println!(
-            "  frames with a mid-exposure {}, with a pulse and no exposure {}; exposure {}",
-            self.mid_after_pulse.len(),
-            self.exposure_missing,
-            quantiles(&mut self.exposure)
-        );
-        println!(
-            "  middle row's mid-exposure after the pulse: {}",
-            quantiles(&mut self.mid_after_pulse)
+            "  right's exposure less the left's: {}",
+            quantiles(&mut self.eye_difference)
         );
     }
 

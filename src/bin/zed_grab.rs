@@ -15,13 +15,15 @@
 //!
 //! --imu: through `Camera`, with the frame marks on. OUT/frames.csv, one line per frame after
 //! --skip: its kernel stamp, its sync pulse on the IMU's clock (empty before the marks are
-//! fitted), the MCU's count of it, whether its images were saved, the exposure and the middle of
-//! the exposure of the image's middle row (`Frame::mid_exposure_ns`). OUT/imu.csv:
+//! fitted), the MCU's count of it, whether its images were saved, each eye's exposure and the
+//! middle of the exposure of its image's middle row (`Frame::mid_exposure_ns`; empty for an eye
+//! whose sensor has not answered for a second). OUT/imu.csv:
 //! every sample after --skip, its time on the host's clock by the MCU's (`time_ns`), its MCU and
 //! read times, gyro (rad/s), accel (m/s²), the frame mark and the MCU's frame count.
-//! OUT/exposure.csv: every reading of the right sensor's exposure registers, when it began (host
-//! ns), how long it took, the exposure in lines (empty when it did not answer). OUT/readout.csv: the line time and the rows
-//! the mid-exposure times were figured with (`Readout`) and the sensor's lines per frame.
+//! OUT/exposure.csv: every reading of both sensors' exposure registers, when it began (host ns),
+//! how long it took, each eye's exposure in lines (empty when it did not answer).
+//! OUT/readout.csv: the line time and the rows the mid-exposure times were figured with
+//! (`Readout`) and the sensor's lines per frame.
 
 use std::fs;
 use std::io::{self, Write};
@@ -180,7 +182,7 @@ fn run(a: Args) -> io::Result<()> {
         let mut frames = io::BufWriter::new(fs::File::create(a.out.join("frames.csv"))?);
         writeln!(
             frames,
-            "kernel_ns,sync_ns,mcu_count,saved,exposure_ns,mid_exposure_ns"
+            "kernel_ns,sync_ns,mcu_count,saved,exposure_left_ns,exposure_right_ns,mid_left_ns,mid_right_ns"
         )?;
         let mut imu = io::BufWriter::new(fs::File::create(a.out.join("imu.csv"))?);
         writeln!(
@@ -188,7 +190,7 @@ fn run(a: Args) -> io::Result<()> {
             "time_ns,mcu_ns,read_ns,gx,gy,gz,ax,ay,az,frame_sync,frame_count"
         )?;
         let mut exposure = io::BufWriter::new(fs::File::create(a.out.join("exposure.csv"))?);
-        writeln!(exposure, "time_ns,read_ns,lines")?;
+        writeln!(exposure, "time_ns,read_ns,left_lines,right_lines")?;
         Some((frames, imu, exposure))
     } else {
         None
@@ -205,19 +207,27 @@ fn run(a: Args) -> io::Result<()> {
         let save = (seen - 1) % a.every == 0;
         if let (Some((frames, imu, exposure)), Source::Camera(camera)) = (&mut csv, &source) {
             let opt = |v: Option<u64>| v.map(|v| v.to_string()).unwrap_or_default();
+            let e = frame.exposure_ns.map(|e| opt(e.map(u64::from)));
+            let m = frame.mid_exposure_ns.map(opt);
             writeln!(
                 frames,
-                "{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{}",
                 frame.timestamp_ns,
                 opt(frame.sync_time_ns),
                 opt(frame.mcu_frame_count.map(u64::from)),
                 save as u8,
-                opt(frame.exposure_ns.map(u64::from)),
-                opt(frame.mid_exposure_ns)
+                e[0],
+                e[1],
+                m[0],
+                m[1]
             )?;
             for r in camera.drain_exposure() {
-                let lines = r.lines.map(|l| format!("{l:.4}")).unwrap_or_default();
-                writeln!(exposure, "{},{},{lines}", r.time_ns, r.read_ns)?;
+                let lines = r.lines.map(|l| l.map(|l| format!("{l:.4}")).unwrap_or_default());
+                writeln!(
+                    exposure,
+                    "{},{},{},{}",
+                    r.time_ns, r.read_ns, lines[0], lines[1]
+                )?;
             }
             synced += frame.sync_time_ns.is_some() as usize;
             for s in &samples {
