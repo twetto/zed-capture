@@ -16,8 +16,10 @@ const MAX_SINCE_MARK_NS: f64 = 1e9;
 /// The sensor whose pulses the MCU marks: the left (see [`Video::enable_frame_sync`]).
 const MARKED_EYE: usize = 0;
 /// The sensor whose exposure is read: the right. The left's registers often do not answer
-/// ([`crate::sensor`]), and the auto exposure gives both the same exposure (but for a few
-/// seconds after the stream starts: LabOrin, the left 779 lines, the right 747, for 4 s).
+/// ([`crate::sensor`]). The camera's auto exposure runs for each eye apart, but close (LabOrin:
+/// the same or 2-30 lines apart, the left 779 and the right 747 for 4 s after the stream
+/// started; at most ~0.6 ms off the left's middle of exposure); a manual exposure
+/// ([`Video::set_manual_exposure`]) is the same on both.
 const EXPOSURE_EYE: usize = 1;
 /// Frames whose arrival after the pulse is averaged before it is used.
 const ARRIVAL_FRAMES: usize = 15;
@@ -187,7 +189,7 @@ impl Camera {
     /// With its pulse, the frame gets the exposure ([`crate::Frame::exposure_ns`]) and the
     /// middle of the exposure of the image's middle row ([`crate::Frame::mid_exposure_ns`]):
     /// the pulse, plus the readout to that row ([`Readout`]), less half the exposure. The
-    /// exposure is the right sensor's (which the auto exposure gives both), its registers'
+    /// exposure is the right sensor's (taken for both: see [`Frame::exposure_ns`](crate::Frame::exposure_ns)), its registers'
     /// newest answer (read once a frame, in a thread of its own) from before the previous
     /// frame's pulse, and at most 1 s before: OmniVision's sensors take a new exposure at a
     /// frame's start, for the frame after. While the auto exposure changes, it may be a frame

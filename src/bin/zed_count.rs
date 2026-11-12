@@ -1,7 +1,7 @@
 //! Reads the ZED's video and IMU for a while and counts what was lost, and where.
 //!
 //!   zed_count [--seconds 60] [--skip 3] [--work-ms 0] [--hogs 0] [--buffers 8] [--ring 8] [--no-imu] [--gaps]
-//!             [--video /dev/videoN --hid /dev/hidrawN]
+//!             [--mains 50|60] [--video /dev/videoN --hid /dev/hidrawN]
 //!
 //! --work-ms: CPU work per frame in the reading thread (a consumer's stand-in).
 //! --hogs: threads spinning on the CPU meanwhile.
@@ -28,6 +28,7 @@ struct Args {
     hid: Option<PathBuf>,
     no_imu: bool,
     gaps: bool,
+    mains_hz: Option<u32>,
 }
 
 fn args() -> Result<Args, String> {
@@ -42,6 +43,7 @@ fn args() -> Result<Args, String> {
         hid: None,
         no_imu: false,
         gaps: false,
+        mains_hz: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -58,6 +60,7 @@ fn args() -> Result<Args, String> {
             "--hogs" => a.hogs = parsed(&flag, &value)?,
             "--buffers" => a.buffers = parsed(&flag, &value)?,
             "--ring" => a.ring = parsed(&flag, &value)?,
+            "--mains" => a.mains_hz = Some(parsed(&flag, &value)?),
             "--video" => a.video = Some(value.into()),
             "--hid" => a.hid = Some(value.into()),
             _ => return Err(format!("unknown option {flag}")),
@@ -113,6 +116,7 @@ fn run() -> Result<(), String> {
     let config = VideoConfig {
         buffers: a.buffers,
         ring: a.ring,
+        mains_hz: a.mains_hz,
         ..Default::default()
     };
     let hid = (!a.no_imu).then_some(hid_path.as_path());
@@ -139,6 +143,17 @@ fn run() -> Result<(), String> {
             ),
             Err(e) => println!("frame marks: not turned on: {e}"),
         }
+    }
+    match video.mains_hz() {
+        Ok(hz) => println!(
+            "mains: {}",
+            if hz == 0 {
+                "anti-flicker off".to_string()
+            } else {
+                format!("{hz} Hz")
+            }
+        ),
+        Err(e) => println!("mains: {e}"),
     }
     match camera.sensor_timing() {
         Ok(t) => println!(

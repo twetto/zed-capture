@@ -32,12 +32,24 @@ const REG_CHIP_ID: u16 = 0x300a;
 const REG_EXPOSURE: u16 = 0x3500;
 const REG_X_OUTPUT_SIZE: u16 = 0x3808;
 const REG_Y_OUTPUT_SIZE: u16 = 0x380a;
+/// Gain over three registers (the first unused: 0); the sensor takes [`GAIN_RANGES`] only.
+const REG_GAIN: u16 = 0x3507;
 /// Pixel clocks per line.
 const REG_HTS: u16 = 0x380c;
 /// Lines per frame.
 const REG_VTS: u16 = 0x380e;
 
 pub const EYES: [&str; 2] = ["left", "right"];
+
+/// The sensor's raw gain takes these ranges only, lowest to highest gain (zed-open-capture's
+/// gain zones).
+pub const GAIN_RANGES: [std::ops::RangeInclusive<u16>; 4] =
+    [0..=255, 378..=511, 890..=1023, 1914..=2047];
+
+/// Each eye's ISP control register (zed-open-capture's ISP_CTRL_LEFT/RIGHT): bit 1 is the
+/// camera's auto exposure and gain for that eye (0x0b on, 0x09 off on LabOrin's ZED 2i).
+const ISP_CONTROL: [u32; 2] = [0x8018_1033, 0x8018_1833];
+const ISP_AUTO_EXPOSURE: u8 = 0x02;
 
 /// What a sensor that does not answer reads.
 const NO_ANSWER: [u8; 2] = [0x00, 0xff];
@@ -63,6 +75,34 @@ impl Device {
     fn read(&mut self, eye: usize, register: u16) -> io::Result<u8> {
         let len = self.len()?;
         xu::read_sensor_register(self.file.as_raw_fd(), len, eye, register)
+    }
+
+    fn write(&mut self, eye: usize, register: u16, value: u8) -> io::Result<()> {
+        let len = self.len()?;
+        xu::write_sensor_register(self.file.as_raw_fd(), len, eye, register, value)
+    }
+
+    fn read_system(&mut self, address: u32) -> io::Result<u8> {
+        let len = self.len()?;
+        xu::read_system_register(self.file.as_raw_fd(), len, address)
+    }
+
+    fn write_system(&mut self, address: u32, value: u8) -> io::Result<()> {
+        let len = self.len()?;
+        xu::write_system_register(self.file.as_raw_fd(), len, address, value)
+    }
+
+    /// `bytes` registers from `register` on, big-endian, read twice; None unless the same.
+    fn read_be_twice(&mut self, eye: usize, register: u16, bytes: u16) -> io::Result<Option<u32>> {
+        let mut once = || -> io::Result<u32> {
+            let mut v = 0u32;
+            for i in 0..bytes {
+                v = v << 8 | self.read(eye, register + i)? as u32;
+            }
+            Ok(v)
+        };
+        let a = once()?;
+        Ok((once()? == a).then_some(a))
     }
 
     /// Whether the sensor answers: its chip id has neither byte of a sensor that does not.
@@ -141,9 +181,129 @@ impl Sensors {
     }
 
     pub(crate) fn write(&self, eye: usize, register: u16, value: u8) -> io::Result<()> {
+        self.device.lock().unwrap().write(eye, register, value)
+    }
+
+    /// Whether the camera's auto exposure and gain is on for `eye` (its ISP's control register,
+    /// which answers reliably, read twice).
+    pub fn auto_exposure(&self, eye: usize) -> io::Result<bool> {
         let mut device = self.device.lock().unwrap();
-        let len = device.len()?;
-        xu::write_sensor_register(device.file.as_raw_fd(), len, eye, register, value)
+        loop {
+            let v = device.read_system(ISP_CONTROL[eye])?;
+            if device.read_system(ISP_CONTROL[eye])? == v {
+                return Ok(v & ISP_AUTO_EXPOSURE != 0);
+            }
+        }
+    }
+
+    /// Turns the camera's auto exposure and gain on or off for `eye`, and checks it took. Off,
+    /// the ISP can still apply an update it had pending some 3 frames later (zed-open-capture):
+    /// wait 5 frames before setting the exposure ([`crate::Video::set_manual_exposure`] does).
+    pub fn set_auto_exposure(&self, eye: usize, on: bool) -> io::Result<()> {
+        let mut device = self.device.lock().unwrap();
+        for _ in 0..5 {
+            let v = device.read_system(ISP_CONTROL[eye])?;
+            let want = if on {
+                v | ISP_AUTO_EXPOSURE
+            } else {
+                v & !ISP_AUTO_EXPOSURE
+            };
+            if v == want {
+                return Ok(());
+            }
+            device.write_system(ISP_CONTROL[eye], want)?;
+        }
+        Err(io::Error::other(format!(
+            "the {} eye's auto exposure stays {}",
+            EYES[eye],
+            if on { "off" } else { "on" }
+        )))
+    }
+
+    /// Writes a sensor's exposure, `lines` whole lines (1 to `max_lines`), and checks it took,
+    /// asking again for up to `wait` while the sensor does not answer.
+    pub fn set_exposure_lines(
+        &self,
+        eye: usize,
+        lines: u32,
+        max_lines: u32,
+        wait: Duration,
+    ) -> io::Result<()> {
+        if !(1..=max_lines).contains(&lines) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("an exposure of {lines} lines: 1 to {max_lines}"),
+            ));
+        }
+        let v = lines * 16;
+        let bytes = [(v >> 16) as u8 & 0x0f, (v >> 8) as u8, v as u8];
+        self.write_checked(eye, REG_EXPOSURE, &bytes, wait, |d| {
+            d.read_be_twice(eye, REG_EXPOSURE, 3)
+                .map(|r| r.map(|r| r & 0xf_ffff == v))
+        })
+    }
+
+    /// A sensor's raw gain, read twice; None unless the same, and one the sensor takes.
+    pub fn gain(&self, eye: usize) -> io::Result<Option<u16>> {
+        let g = self
+            .device
+            .lock()
+            .unwrap()
+            .read_be_twice(eye, REG_GAIN, 3)?;
+        Ok(g.map(|g| (g & 0xffff) as u16)
+            .filter(|g| GAIN_RANGES.iter().any(|r| r.contains(g))))
+    }
+
+    /// Writes a sensor's raw gain (in one of [`GAIN_RANGES`]) and checks it took.
+    pub fn set_gain(&self, eye: usize, gain: u16, wait: Duration) -> io::Result<()> {
+        if !GAIN_RANGES.iter().any(|r| r.contains(&gain)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a raw gain of {gain}: the sensor takes {GAIN_RANGES:?}"),
+            ));
+        }
+        let bytes = [0, (gain >> 8) as u8, gain as u8];
+        self.write_checked(eye, REG_GAIN, &bytes, wait, |d| {
+            d.read_be_twice(eye, REG_GAIN, 3)
+                .map(|r| r.map(|r| r == gain as u32))
+        })
+    }
+
+    /// Writes `bytes` from `register` on, until `took` says they did (Some(true)), for up to
+    /// `wait`.
+    fn write_checked(
+        &self,
+        eye: usize,
+        register: u16,
+        bytes: &[u8],
+        wait: Duration,
+        mut took: impl FnMut(&mut Device) -> io::Result<Option<bool>>,
+    ) -> io::Result<()> {
+        let deadline = Instant::now() + wait;
+        let mut device = self.device.lock().unwrap();
+        loop {
+            if device.answering(eye)? {
+                for (i, b) in bytes.iter().enumerate() {
+                    device.write(eye, register + i as u16, *b)?;
+                }
+                if took(&mut device)? == Some(true) && device.answering(eye)? {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "the {} sensor's register {register:#06x} did not take {bytes:02x?} in {:.1} s",
+                        EYES[eye],
+                        wait.as_secs_f64()
+                    ),
+                ));
+            }
+            drop(device);
+            std::thread::sleep(RETRY);
+            device = self.device.lock().unwrap();
+        }
     }
 
     /// A sensor's timing, checked, asking again for up to `wait`.

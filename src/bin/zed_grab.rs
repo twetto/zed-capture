@@ -2,11 +2,16 @@
 //! IMU sample and each frame's time on the IMU's clock.
 //!
 //!   zed_grab OUT [--frames 5] [--every 15] [--skip 3] [--left-only] [--imu] [--video /dev/videoN]
+//!                [--mains 50|60] [--exposure-ms MS [--gain RAW]]
 //!
 //! `OUT/left/<ns>.pgm` and `OUT/right/<ns>.pgm`, named by the frame's kernel timestamp
 //! (CLOCK_MONOTONIC ns), one frame in every --every, after --skip seconds for the auto exposure to
 //! settle (and, with --imu, for the frame marks to be fitted). OUT/serial.txt holds the camera's
 //! serial number, which names its factory calibration (`/usr/local/zed/settings/SN<serial>.conf`).
+//!
+//! --mains: the lights' mains frequency, for the camera's anti-flicker (Taiwan: 60). --exposure-ms:
+//! a manual exposure on both sensors (the camera's auto exposure off; back on at exit), with the
+//! raw --gain (0-255, 378-511, 890-1023 or 1914-2047; else the gain the auto exposure left).
 //!
 //! --imu: through `Camera`, with the frame marks on. OUT/frames.csv, one line per frame after
 //! --skip: its kernel stamp, its sync pulse on the IMU's clock (empty before the marks are
@@ -34,9 +39,12 @@ struct Args {
     left_only: bool,
     imu: bool,
     video: Option<PathBuf>,
+    mains_hz: Option<u32>,
+    exposure_ms: Option<f64>,
+    gain: Option<u16>,
 }
 
-const USAGE: &str = "usage: zed_grab OUT [--frames 5] [--every 15] [--skip 3] [--left-only] [--imu] [--video /dev/videoN]";
+const USAGE: &str = "usage: zed_grab OUT [--frames 5] [--every 15] [--skip 3] [--left-only] [--imu] [--video /dev/videoN] [--mains 50|60] [--exposure-ms MS [--gain RAW]]";
 
 fn args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
@@ -48,6 +56,9 @@ fn args() -> Result<Args, String> {
         left_only: false,
         imu: false,
         video: None,
+        mains_hz: None,
+        exposure_ms: None,
+        gain: None,
     };
     let mut out = None;
     while let Some(arg) = it.next() {
@@ -75,12 +86,18 @@ fn args() -> Result<Args, String> {
             "--every" => a.every = value.parse::<usize>().map_err(|_| bad())?.max(1),
             "--skip" => a.skip = value.parse().map_err(|_| bad())?,
             "--video" => a.video = Some(PathBuf::from(value)),
+            "--mains" => a.mains_hz = Some(value.parse().map_err(|_| bad())?),
+            "--exposure-ms" => a.exposure_ms = Some(value.parse().map_err(|_| bad())?),
+            "--gain" => a.gain = Some(value.parse().map_err(|_| bad())?),
             _ => return Err(format!("unknown option {arg}\n{USAGE}")),
         }
     }
     a.out = out.ok_or(USAGE)?;
     if a.imu && a.video.is_some() {
         return Err("--imu finds the camera itself: no --video".into());
+    }
+    if a.gain.is_some() && a.exposure_ms.is_none() {
+        return Err("--gain goes with --exposure-ms".into());
     }
     Ok(a)
 }
@@ -117,24 +134,37 @@ impl Source {
 }
 
 fn run(a: Args) -> io::Result<()> {
+    let config = VideoConfig {
+        mains_hz: a.mains_hz,
+        ..Default::default()
+    };
     let (source, serial) = match (&a.video, a.imu) {
-        (Some(v), _) => (Source::Video(Video::open(v, VideoConfig::default())?), None),
+        (Some(v), _) => (Source::Video(Video::open(v, config)?), None),
         (None, false) => {
             let d = find()?;
-            (
-                Source::Video(Video::open(&d.video, VideoConfig::default())?),
-                d.serial,
-            )
+            (Source::Video(Video::open(&d.video, config)?), d.serial)
         }
         (None, true) => {
             let d = find()?;
-            let camera = Camera::open(&d.video, Some(&d.hid), VideoConfig::default())?;
+            let camera = Camera::open(&d.video, Some(&d.hid), config)?;
             if let Err(e) = camera.frame_sync() {
                 eprintln!("zed_grab: no frame marks ({e}): frames.csv without sync times");
             }
             (Source::Camera(camera), d.serial)
         }
     };
+    if let Some(ms) = a.exposure_ms {
+        let m = source
+            .video()
+            .set_manual_exposure(Duration::from_secs_f64(ms / 1e3), a.gain)?;
+        eprintln!(
+            "zed_grab: manual exposure {} lines = {:.3} ms (line {:.3} µs), gain {:?}",
+            m.lines,
+            m.exposure_ns / 1e6,
+            m.line_ns / 1e3,
+            m.gain
+        );
+    }
     let eyes: &[&str] = if a.left_only {
         &["left"]
     } else {

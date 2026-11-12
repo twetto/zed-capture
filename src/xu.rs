@@ -1,7 +1,7 @@
 //! The camera's vendor requests through its UVC extension unit, as zed-open-capture's
 //! `ll_VendorControl`: a 384-byte request written with SET_CUR (64 bytes over USB 2) and, for a
 //! read, the answer read back with GET_CUR. Used here to reach the image sensors' registers over
-//! the camera's I2C.
+//! the camera's I2C, and the camera's ISP's (an OmniVision OV580's) own registers.
 
 use std::io;
 use std::mem::size_of;
@@ -77,6 +77,34 @@ fn request(fd: RawFd, len: usize, buf: &mut [u8; REQUEST_LEN], read: bool) -> io
     Ok(())
 }
 
+/// The ISP's own registers ("system registers": 32-bit addresses).
+const SYSTEM: u8 = 0xa2;
+
+fn system_request(task: u8, address: u32) -> [u8; REQUEST_LEN] {
+    let mut b = [0u8; REQUEST_LEN];
+    b[0] = task;
+    b[1] = SYSTEM;
+    b[3] = 4; // address bytes
+    b[4] = 1; // data bytes
+    b[5..9].copy_from_slice(&address.to_be_bytes());
+    b[10] = 0x01;
+    b[12] = 0x01;
+    b
+}
+
+/// One byte of the ISP's registers.
+pub fn read_system_register(fd: RawFd, len: usize, address: u32) -> io::Result<u8> {
+    let mut b = system_request(TASK_GET, address);
+    request(fd, len, &mut b, true)?;
+    Ok(b[17])
+}
+
+pub fn write_system_register(fd: RawFd, len: usize, address: u32, value: u8) -> io::Result<()> {
+    let mut b = system_request(TASK_SET, address);
+    b[16] = value;
+    request(fd, len, &mut b, false)
+}
+
 fn sensor_request(task: u8, eye: usize, register: u16) -> [u8; REQUEST_LEN] {
     let mut b = [0u8; REQUEST_LEN];
     b[0] = task;
@@ -124,6 +152,12 @@ mod tests {
         assert_eq!(
             &b[..13],
             &[0x51, 0xa5, 0x6c, 2, 1, 0, 0, 0x30, 0x02, 0x90, 1, 0, 1]
+        );
+        // zed-open-capture's ll_write_system_register, the left ISP's control
+        let s = system_request(TASK_SET, 0x8018_1033);
+        assert_eq!(
+            &s[..13],
+            &[0x50, 0xa2, 0, 4, 1, 0x80, 0x18, 0x10, 0x33, 0, 1, 0, 1]
         );
     }
 }

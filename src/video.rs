@@ -150,6 +150,37 @@ const VIDIOC_DQBUF: libc::c_ulong = ioc(READ | WRITE, b'V', 17, size_of::<Buffer
 const VIDIOC_STREAMON: libc::c_ulong = ioc(WRITE, b'V', 18, size_of::<libc::c_int>());
 const VIDIOC_STREAMOFF: libc::c_ulong = ioc(WRITE, b'V', 19, size_of::<libc::c_int>());
 const VIDIOC_S_PARM: libc::c_ulong = ioc(READ | WRITE, b'V', 22, size_of::<StreamParm>());
+const VIDIOC_G_CTRL: libc::c_ulong = ioc(READ | WRITE, b'V', 27, size_of::<Control>());
+const VIDIOC_S_CTRL: libc::c_ulong = ioc(READ | WRITE, b'V', 28, size_of::<Control>());
+
+/// `struct v4l2_control`.
+#[repr(C)]
+struct Control {
+    id: u32,
+    value: i32,
+}
+
+/// V4L2_CID_POWER_LINE_FREQUENCY: 0 off, 1 50 Hz, 2 60 Hz.
+const CID_POWER_LINE_FREQUENCY: u32 = 0x0098_0918;
+
+fn set_mains(fd: RawFd, hz: u32) -> io::Result<()> {
+    let value = match hz {
+        0 => 0,
+        50 => 1,
+        60 => 2,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("mains of {hz} Hz: 50, 60 or 0 (off)"),
+            ));
+        }
+    };
+    let mut c = Control {
+        id: CID_POWER_LINE_FREQUENCY,
+        value,
+    };
+    sys::ioctl(fd, VIDIOC_S_CTRL, &mut c).map_err(|e| context(e, "the power line frequency"))
+}
 
 /// No good frame for this long stops the capture with an error.
 const STALL: Duration = Duration::from_secs(3);
@@ -177,6 +208,9 @@ pub struct VideoConfig {
     pub buffers: u32,
     /// Frames kept for the reader. When it is full, the oldest is dropped and counted.
     pub ring: usize,
+    /// The mains frequency of the lights (Hz: 50, 60, or 0 for none), set at open (see
+    /// [`Video::set_mains_hz`]); None leaves the camera's (50 Hz at power-up).
+    pub mains_hz: Option<u32>,
 }
 
 impl Default for VideoConfig {
@@ -187,6 +221,7 @@ impl Default for VideoConfig {
             fps: 30,
             buffers: 8,
             ring: 8,
+            mains_hz: None,
         }
     }
 }
@@ -207,8 +242,10 @@ pub struct Frame {
     pub sync_time_ns: Option<u64>,
     /// The MCU's count of this frame, with `sync_time_ns`.
     pub mcu_frame_count: Option<u32>,
-    /// The exposure (ns), with `sync_time_ns`, as the auto exposure set it: the right sensor's,
-    /// which it gives the left too ([`Camera::next`](crate::Camera::next) says which reading).
+    /// The exposure (ns), with `sync_time_ns`: the right sensor's, taken for both. The camera's
+    /// auto exposure runs for each eye apart, but close (LabOrin: the same or 2-30 lines, up to
+    /// 1.2 ms, apart); a manual one ([`Video::set_manual_exposure`]) is the same on both.
+    /// [`Camera::next`](crate::Camera::next) says which reading.
     pub exposure_ns: Option<u32>,
     /// The middle of the exposure of the image's middle row (host ns), with `exposure_ns`: see
     /// [`Camera::next`](crate::Camera::next). Rolling shutter: the other rows' come up to half a
@@ -284,7 +321,26 @@ pub struct Video {
     _maps: Arc<Vec<Mapping>>,
     file: File,
     sensors: Sensors,
+    /// The camera's auto exposure was turned off here: turned back on when dropped.
+    manual: AtomicBool,
 }
+
+/// A manual exposure as set ([`Video::set_manual_exposure`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ManualExposure {
+    /// In the sensor's lines…
+    pub lines: u32,
+    /// …and in ns, by the line time below.
+    pub exposure_ns: f64,
+    /// The frame period by the driver's frame rate over the sensor's lines per frame.
+    pub line_ns: f64,
+    /// The gain both sensors have (raw).
+    pub gain: [Option<u16>; 2],
+}
+
+/// The longest manual exposure: the frame's lines less these (800 at HD720, tried at 30 Hz with
+/// no frame lost); longer, the sensor would stretch the frame.
+const EXPOSURE_MARGIN_LINES: u32 = 32;
 
 impl Video {
     /// Opens the V4L2 capture device (e.g. `/dev/video0`) and starts streaming. Turn the
@@ -350,6 +406,9 @@ impl Video {
             ..zeroed()
         };
         sys::ioctl(fd, VIDIOC_S_PARM, &mut parm).map_err(|e| context(e, "VIDIOC_S_PARM"))?;
+        if let Some(hz) = config.mains_hz {
+            set_mains(fd, hz)?;
+        }
         // SAFETY: the driver filled in the capture member.
         let tpf = unsafe { parm.parm.capture.timeperframe };
         let fps = if tpf.numerator > 0 {
@@ -433,6 +492,7 @@ impl Video {
             _maps: maps,
             sensors: Sensors::new(file.try_clone()?),
             file,
+            manual: AtomicBool::new(false),
         })
     }
 
@@ -542,10 +602,95 @@ impl Video {
     pub fn sensors(&self) -> &Sensors {
         &self.sensors
     }
+
+    /// Sets the mains frequency of the lights (50 or 60 Hz, or 0 for none): the camera's auto
+    /// exposure keeps to whole periods of their flicker (twice the mains). LabOrin's ZED 2i at
+    /// night: 747 lines (29.93 ms, 3 × 10 ms) at 50 Hz, 621 (24.88 ms, 3 × 8.33 ms) at 60 Hz.
+    /// The camera powers up at 50 Hz; Taiwan's mains are 60 Hz.
+    pub fn set_mains_hz(&self, hz: u32) -> io::Result<()> {
+        set_mains(self.file.as_raw_fd(), hz)
+    }
+
+    /// The camera's mains frequency (Hz; 0: none).
+    pub fn mains_hz(&self) -> io::Result<u32> {
+        let mut c = Control {
+            id: CID_POWER_LINE_FREQUENCY,
+            value: 0,
+        };
+        sys::ioctl(self.file.as_raw_fd(), VIDIOC_G_CTRL, &mut c)
+            .map_err(|e| context(e, "the power line frequency"))?;
+        Ok(match c.value {
+            1 => 50,
+            2 => 60,
+            _ => 0,
+        })
+    }
+
+    /// Whether the camera's auto exposure and gain is on, per eye.
+    pub fn auto_exposure(&self) -> io::Result<[bool; 2]> {
+        Ok([self.sensors.auto_exposure(0)?, self.sensors.auto_exposure(1)?])
+    }
+
+    /// Turns the camera's auto exposure and gain back on, both eyes.
+    pub fn set_auto_exposure(&self) -> io::Result<()> {
+        self.sensors.set_auto_exposure(0, true)?;
+        self.sensors.set_auto_exposure(1, true)?;
+        self.manual.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// A manual exposure, the same on both sensors, as zed-open-capture sets it: the camera's
+    /// auto exposure and gain off (each eye's ISP), 5 frames' wait if it was on (the ISP can
+    /// still apply an update it had pending), then `exposure` in whole lines (at least 1, at
+    /// most the frame's lines less 32) and `gain` (raw, in [`crate::sensor::GAIN_RANGES`]; None
+    /// keeps the gain the auto exposure left) written to each sensor and checked. Each frame's
+    /// exposure ([`Frame::exposure_ns`]) then is this. The auto exposure comes back on when the
+    /// video is dropped, or with [`Video::set_auto_exposure`]; if the process dies first, it
+    /// stays off until the camera is unplugged.
+    pub fn set_manual_exposure(
+        &self,
+        exposure: Duration,
+        gain: Option<u16>,
+    ) -> io::Result<ManualExposure> {
+        let wait = Duration::from_secs(2);
+        let timing = self
+            .sensors
+            .timing(1, wait)
+            .or_else(|_| self.sensors.timing(0, wait))?;
+        let line_ns = 1e9 / self.fps / timing.frame_length as f64;
+        let max = (timing.frame_length as u32).saturating_sub(EXPOSURE_MARGIN_LINES);
+        let lines = ((exposure.as_nanos() as f64 / line_ns).round() as u32).clamp(1, max);
+        let was_on = self.auto_exposure()?;
+        self.manual.store(true, Ordering::Relaxed);
+        for eye in 0..2 {
+            self.sensors.set_auto_exposure(eye, false)?;
+        }
+        if was_on.contains(&true) {
+            std::thread::sleep(Duration::from_secs_f64(5.0 / self.fps));
+        }
+        for (eye, name) in EYES.iter().enumerate() {
+            let what = |e: io::Error| context(e, &format!("the {name} sensor's exposure"));
+            self.sensors
+                .set_exposure_lines(eye, lines, max, wait)
+                .map_err(what)?;
+            if let Some(g) = gain {
+                self.sensors.set_gain(eye, g, wait).map_err(what)?;
+            }
+        }
+        Ok(ManualExposure {
+            lines,
+            exposure_ns: lines as f64 * line_ns,
+            line_ns,
+            gain: [self.sensors.gain(0)?, self.sensors.gain(1)?],
+        })
+    }
 }
 
 impl Drop for Video {
     fn drop(&mut self) {
+        if self.manual.load(Ordering::Relaxed) {
+            let _ = self.set_auto_exposure();
+        }
         self.shared.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

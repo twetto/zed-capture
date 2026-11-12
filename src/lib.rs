@@ -30,7 +30,7 @@ pub use clock::FrameClock;
 pub use device::{Devices, find, reattach_hid};
 pub use imu::{Imu, ImuSample, ImuStats};
 pub use sensor::{ExposureReading, ExposureStats, SensorTiming, Sensors};
-pub use video::{Frame, Video, VideoConfig, VideoStats};
+pub use video::{Frame, ManualExposure, Video, VideoConfig, VideoStats};
 
 /// `CLOCK_MONOTONIC` in nanoseconds: the clock of the kernel's frame timestamps.
 pub fn monotonic_ns() -> u64 {

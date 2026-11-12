@@ -50,9 +50,10 @@ frame got its pulse; each frame's kernel stamp came 1.1-1.7 ms after it, and pul
 
 **When the image was exposed.** The sensors (OmniVision OV4689s) have a rolling shutter: HD720 at
 30 Hz is 832 lines of 40.07 µs a frame, the image's 720 rows read over 29 ms. `Camera` reads the
-exposure the camera's auto exposure set, once a frame, from the right sensor's registers (the
-auto exposure gives both sensors the same; the left's registers often don't answer while the
-camera streams: they read 0xff or 0x00, for single reads or seconds on end), and gives each frame
+exposure, once a frame, from the right sensor's registers (the camera's auto exposure runs for
+each eye apart but close, the same or up to ~30 lines apart; the left's registers often don't
+answer while the camera streams: they read 0xff or 0x00, for single reads or seconds on end),
+and gives each frame
 its exposure (`Frame::exposure_ns`) and the middle of the exposure of its middle row
 (`Frame::mid_exposure_ns`): the pulse, plus 4.02 ms to the first row (the frame's blanking
 lines, 4.33 ms, less 0.31 ms measured), plus the readout to that row, less half the exposure.
