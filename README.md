@@ -161,6 +161,24 @@ line time for rolling-shutter work. Stamps are `CLOCK_MONOTONIC` plus the system
 the start, one offset for the whole file (an NTP step during recording shows on `/zed/clock`).
 The file's `zed` metadata has the settings, its `stats` metadata what was recorded and lost.
 
+```
+zed_ros [--exposure active|gradient|camera] [--mains 50|60] [--eyes both|left|right]
+        [--best-effort] [--depth N] [--no-imu] [--prefix /zed] [--seconds S]
+```
+
+Publishes the images (`/zed/<eye>/image_raw`, `sensor_msgs/Image` mono8, unrectified) and every
+IMU sample (`/zed/imu`) as ROS 2 topics, through [r2r](https://github.com/sequenceplanner/r2r).
+Both eyes carry the frame's stamp (the left image's mid-exposure, on the system clock), so an
+exact time synchroniser pairs them. Images over Fast DDS's shared memory need a segment larger
+than the default 512 KB on the publisher (`FASTRTPS_DEFAULT_PROFILES_FILE`): with 16 MB no frame
+was lost on the way, without it 0.4-2.6 % (docs/measurements.md). It is its own crate,
+`crates/zed-capture-ros`, built with a ROS 2 environment sourced (Humble or newer):
+
+```
+source /opt/ros/humble/setup.bash
+cd crates/zed-capture-ros && cargo build --release   # target/release/zed_ros
+```
+
 ## Building for a Jetson (JetPack 6)
 
 ```

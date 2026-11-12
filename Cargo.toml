@@ -1,5 +1,7 @@
 [workspace]
 members = [".", "crates/zed-capture-python"]
+# Builds only with a ROS 2 environment sourced (r2r): its own lock file and target
+exclude = ["crates/zed-capture-ros"]
 
 [package]
 name = "zed-capture"

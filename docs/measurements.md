@@ -358,6 +358,34 @@ both eyes, read twice, against 13.9 ms for the exposure alone byte by byte.
   75 % of it the work: capture and bindings about 5 %.
 - Opening took 2.8 s, most of it waiting for the frame marks.
 
+## ROS 2 topics (`zed_ros`)
+
+`zed_ros` (active exposure, both eyes, raw mono8, reliable keep-last 1) on LabOrin (Humble, Fast
+DDS 2.6), subscribers in other processes on the same machine, best effort keep-last 1 as
+pipeline_node's; 60 s a case. Frames lost by the stamps' gaps:
+
+| Case | Lost by the subscribers | Lost by the camera |
+|---|---|---|
+| One plain subscriber | 0 of 1801 | 0 |
+| A plain one and a node-like one (exact left/right pairs, 25 ms work a pair) | 0 of 1801, pairs too | 0 |
+| The same and `ros2 bag record` of both images | the camera's 6 (the bag: all 1802 published) | 6 |
+| The same under 4 busy loops | the camera's 60 | 61 |
+| No shared-memory profile on the publisher (512 KB segment) | node-like 2.55 %, plain 0.39 % left, 1.28 % right | 0 |
+
+With the 16 MB segment (mr-neuro-nav's `fastdds_shm16.xml`) the subscribers got every frame the
+camera gave. Publishing took 0.6-0.9 ms an image; images reached the subscribers 28-31 ms after
+their mid-exposure.
+
+### The camera lost frames under CPU load (open)
+
+The same night, every build lost frames while the CPUs were busy, from the kernel (uvcvideo's
+sequence skipping 2 a frame, no bad buffers, no USB error logged then): in 40 s, 1 with 2 busy
+threads, 14-17 with 4, 22 with 6, none idle. The same with the busy loops at nice 19 or pinned
+away from CPU 0 (the USB host's interrupt), with or without the IMU, and with the build from
+before frame sync (14 with the sensors' sync output off, 32 with it on). On 2026-11-12 the same
+test had lost none with 6 busy threads. That night LabOrin ran on a power bank (36 %); not yet
+repeated on its wall supply.
+
 ## Not measured
 
 - Other video modes and frame rates (the 0.31 ms is measured at HD720 at 30 Hz only).

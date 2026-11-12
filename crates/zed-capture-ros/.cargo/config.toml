@@ -1,0 +1,4 @@
+# r2r generates Rust types for every message package in the sourced ROS environment unless
+# told which: the ones used here, and the ones r2r itself uses.
+[env]
+IDL_PACKAGE_FILTER = "std_msgs;sensor_msgs;geometry_msgs;builtin_interfaces;rcl_interfaces;rosgraph_msgs;action_msgs;unique_identifier_msgs"
