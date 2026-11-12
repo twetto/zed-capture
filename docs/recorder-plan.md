@@ -94,7 +94,7 @@ be corrected. `FrameTiming` keeps the monotonic times.
 
 ## Steps
 
-Done (2026-11-12): 0 and 1, with CPU JPEG and raw (results in `measurements.md`).
+Done (2026-11-12): 0, 1 and 2 (results in `measurements.md`).
 
 0. zed-capture reads each eye's exposure and gain in one request: the extension unit returns up
    to 13 consecutive registers when the request's count (bytes 9-10) says so (tested: 0x3500 and

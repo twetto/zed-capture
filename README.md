@@ -91,8 +91,8 @@ Saves left and right grey as PGM files named by their kernel stamp, and the came
 time).
 
 ```
-zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|raw] [--quality 90] [--every 1]
-                    [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--seconds S]
+zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|nvjpg|raw] [--quality 90]
+                    [--every 1] [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--seconds S]
 ```
 
 Records the images, IMU and frame timing into one MCAP file of ROS 2 messages, with their
@@ -107,8 +107,11 @@ Recording starts once the frame sync is ready (~3 s) and stops on Ctrl-C, SIGTER
 | `/zed/imu` | `sensor_msgs/Imu` (the IMU's axes; no orientation) | the sample |
 | `/zed/clock` | `zed_capture/ClockOffset` | once a second |
 
-`image_raw` is unrectified; the camera's factory calibration is attached to the file. With
-`--encoding raw` the images are `sensor_msgs/Image` (mono8) on `/zed/<eye>/image_raw`. Every frame's
+`image_raw` is unrectified; the camera's factory calibration is attached to the file. JPEG is
+encoded on the CPU (grey, about 10 ms an image on an Orin Nano) or, with `--encoding nvjpg`, on the
+Jetson's hardware encoder (3-channel with flat chroma, format `bgr8; jpeg compressed bgr8`; the
+recorder then takes about a quarter of the CPU). With `--encoding raw` the images are
+`sensor_msgs/Image` (mono8) on `/zed/<eye>/image_raw`. Every frame's
 `FrameTiming` has both eyes' exposure, gain and mid-exposure, where each exposure came from (the
 eye's own sensor, set by hand, or the other eye's when the left sensor did not answer), and the
 line time for rolling-shutter work. Stamps are `CLOCK_MONOTONIC` plus the system clock's offset at
@@ -120,6 +123,13 @@ The file's `zed` metadata has the settings, its `stats` metadata what was record
 ```
 cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.35
 cargo zigbuild --release --features record --target aarch64-unknown-linux-gnu.2.35  # zed_record too
+```
+
+`zed_record` with NVJPG links JetPack's GStreamer, so build it on the Jetson (Rust 1.92 or newer,
+`libgstreamer1.0-dev` and `libgstreamer-plugins-base1.0-dev`):
+
+```
+cargo build --release --features nvjpg --bin zed_record
 ```
 
 The user needs read and write access to `/dev/videoN` (the `video` group) and

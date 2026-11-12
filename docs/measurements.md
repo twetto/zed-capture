@@ -62,10 +62,16 @@ A read is two calls: the request, then its answer. A second process's request be
 the answer. A test script run alongside zed-capture's exposure thread read the exposure's middle
 byte (0x30) as register 0x3002 and wrote it back with bit 7 set (0xb0). It was restored to 0x80.
 
-### The camera stuck once
+### USB link errors: lost frames, and the camera stuck once
 
-Once, at the start of a run, the camera stopped streaming, and even the ZED SDK reported "camera not
-detected" until a replug. The next 55 starts of the same code were clean. Cause unknown.
+The kernel logs `uvcvideo: Non-zero status (-71) in video completion handler` (EPROTO, a USB
+protocol error) every few minutes while the camera streams: 7-66 an hour, 142 in one day, with
+the camera behind the dev kit's USB hub. Each one costs a frame: the two frames lost in recording
+runs (below) were lost at the second of such an error. Once, a burst of six in three seconds was
+followed by the camera stopping altogether, until a replug (even the ZED SDK reported "camera not
+detected"); the next 55 starts of the same code were clean. The same happened on 2026-11-05 with
+only the ZED SDK running: errors more and more often, then a dead camera. Check with
+`journalctl -k | grep -c "status (-71)"`.
 
 ## When the image is exposed
 
@@ -158,15 +164,16 @@ was lost with it.
 
 60 s at 30 Hz on LabOrin, auto exposure at 60 Hz mains:
 
-| Recording | Frames lost | Encoding | File |
-|---|---|---|---|
-| both eyes, JPEG q90 (2 runs) | 1 of 1801 each | 10.1-10.3 ms an image (CPU) | 6.2 MB/s, ~100 KiB an image |
-| left eye, JPEG q90 (20 s) | 0 of 601 | 10.3 ms | 3.5 MB/s |
-| both eyes, raw (10 s) | 0 of 302 | 0.3 ms | 56 MB/s |
+| Recording | Frames lost | Encoding an image | Recorder's CPU | File |
+|---|---|---|---|---|
+| both eyes, JPEG q90 (2 × 60 s, 30 s) | 1, 1 of 1801; 0 of 901 | 10.0-10.3 ms (CPU) | 65 % of a core | 6.2 MB/s, 91-107 KiB an image |
+| both eyes, NVJPG q90 (60 s, 30 s) | 1 of 1800; 0 of 901 | 5.5-6.9 ms (mostly waiting) | 17 % of a core | 6.7 MB/s, 95-117 KiB an image |
+| left eye, JPEG q90 (20 s) | 0 of 601 | 10.3 ms | | 3.5 MB/s |
+| both eyes, raw (10 s) | 0 of 302 | 0.3 ms | | 56 MB/s |
 
-The recorder took 65 % of one core with both eyes in JPEG. The lost frames were lost in the kernel
-(the MCU's count and the kernel's sequence both jumped), not by zed-capture; recording without
-encoding lost none, so the encoding's CPU likely delays the USB interrupts (on CPU0). Reading
+Each lost frame was lost in the kernel (the MCU's count and the kernel's sequence both jumped) at
+the second of a USB protocol error (above), not by the recorder. NVJPG's JPEGs have three channels
+(flat chroma): 3-4 % larger than the CPU's grey ones at the same quality. Reading
 each eye's exposure and gain in one request (registers 0x3500-0x3509) took 6.9 ms a frame for
 both eyes, read twice, against 13.9 ms for the exposure alone byte by byte.
 

@@ -1,7 +1,7 @@
 //! Records the ZED's images, IMU and frame timing into one MCAP file (ROS 2 messages, their
 //! definitions in the file).
 //!
-//!   zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|raw] [--quality 90] [--every 1]
+//!   zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|nvjpg|raw] [--quality 90] [--every 1]
 //!                       [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--seconds S] [--encoders N]
 //!
 //! Each image is stamped at its eye's middle row's mid-exposure, its `CameraExposure` beside it
@@ -14,6 +14,8 @@
 
 mod cdr;
 mod msgs;
+#[cfg(feature = "nvjpg")]
+mod nvjpg;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -31,7 +33,7 @@ use msgs::{Exposure, FrameTiming, Source};
 use zed_capture::{Camera, VideoConfig, find, monotonic_ns};
 
 const EYES: [&str; 2] = ["left", "right"];
-const USAGE: &str = "usage: zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|raw] [--quality 90] [--every 1] [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--seconds S] [--encoders N]";
+const USAGE: &str = "usage: zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|nvjpg|raw] [--quality 90] [--every 1] [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--seconds S] [--encoders N]";
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -42,6 +44,7 @@ extern "C" fn on_signal(_: libc::c_int) {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Encoding {
     Jpeg,
+    Nvjpg,
     Raw,
 }
 
@@ -95,7 +98,13 @@ fn args() -> Result<Args, String> {
                 a.encoding = match value.as_str() {
                     "jpeg" => Encoding::Jpeg,
                     "raw" => Encoding::Raw,
-                    "nvjpg" => return Err("--encoding nvjpg is not built yet".into()),
+                    "nvjpg" if cfg!(feature = "nvjpg") => Encoding::Nvjpg,
+                    "nvjpg" => {
+                        return Err(
+                            "--encoding nvjpg: built without the nvjpg feature (build on the Jetson: cargo build --release --features nvjpg)"
+                                .into(),
+                        );
+                    }
                     _ => return Err(bad()),
                 }
             }
@@ -214,7 +223,7 @@ fn open_file(
     for (eye, name) in EYES.iter().enumerate() {
         if a.eyes[eye] {
             image[eye] = Some(match a.encoding {
-                Encoding::Jpeg => add(
+                Encoding::Jpeg | Encoding::Nvjpg => add(
                     msgs::compressed_image_schema(),
                     &format!("/zed/{name}/image_raw/compressed"),
                 )?,
@@ -322,29 +331,55 @@ fn meter(data: &[u8], width: usize) -> (f32, f32) {
     (sum as f32 / n, clipped as f32 / n)
 }
 
-fn encode(job: &Job, encoding: Encoding, quality: u8, frame_id: &str) -> Result<Vec<u8>, String> {
-    Ok(match encoding {
-        Encoding::Jpeg => {
-            let mut jpeg = Vec::with_capacity(job.data.len() / 4);
-            jpeg_encoder::Encoder::new(&mut jpeg, quality)
-                .encode(
-                    &job.data,
-                    job.width as u16,
-                    job.height as u16,
-                    jpeg_encoder::ColorType::Luma,
+/// An encoder thread's: CPU JPEG, raw, or an NVJPG pipeline of its own.
+enum Coder {
+    Jpeg(u8),
+    Raw,
+    #[cfg(feature = "nvjpg")]
+    Nvjpg(nvjpg::Nvjpg),
+}
+
+impl Coder {
+    fn new(encoding: Encoding, quality: u8, width: usize, height: usize) -> Result<Coder, String> {
+        let _ = (width, height);
+        Ok(match encoding {
+            Encoding::Jpeg => Coder::Jpeg(quality),
+            Encoding::Raw => Coder::Raw,
+            #[cfg(feature = "nvjpg")]
+            Encoding::Nvjpg => Coder::Nvjpg(nvjpg::Nvjpg::new(width, height, quality)?),
+            #[cfg(not(feature = "nvjpg"))]
+            Encoding::Nvjpg => return Err("built without the nvjpg feature".into()),
+        })
+    }
+
+    /// The image's message (its data taken).
+    fn encode(&self, job: &mut Job, frame_id: &str) -> Result<Vec<u8>, String> {
+        let data = std::mem::take(&mut job.data);
+        Ok(match self {
+            Coder::Jpeg(quality) => {
+                let mut jpeg = Vec::with_capacity(data.len() / 4);
+                jpeg_encoder::Encoder::new(&mut jpeg, *quality)
+                    .encode(
+                        &data,
+                        job.width as u16,
+                        job.height as u16,
+                        jpeg_encoder::ColorType::Luma,
+                    )
+                    .map_err(|e| e.to_string())?;
+                msgs::compressed_image(
+                    job.stamp_ns,
+                    frame_id,
+                    "mono8; jpeg compressed mono8",
+                    &jpeg,
                 )
-                .map_err(|e| e.to_string())?;
-            msgs::compressed_image(
-                job.stamp_ns,
-                frame_id,
-                "mono8; jpeg compressed mono8",
-                &jpeg,
-            )
-        }
-        Encoding::Raw => {
-            msgs::image_mono8(job.stamp_ns, frame_id, job.width, job.height, &job.data)
-        }
-    })
+            }
+            Coder::Raw => msgs::image_mono8(job.stamp_ns, frame_id, job.width, job.height, &data),
+            #[cfg(feature = "nvjpg")]
+            Coder::Nvjpg(n) => {
+                msgs::compressed_image(job.stamp_ns, frame_id, nvjpg::FORMAT, &n.encode(data)?)
+            }
+        })
+    }
 }
 
 fn spawn_encoders(
@@ -366,16 +401,33 @@ fn spawn_encoders(
             std::thread::Builder::new()
                 .name(format!("zed-record-enc{i}"))
                 .spawn(move || {
+                    let mut coder = None;
                     loop {
                         let Ok(mut job) = rx.lock().unwrap().recv() else {
                             return;
                         };
+                        if coder.is_none() {
+                            match Coder::new(
+                                encoding,
+                                quality,
+                                job.width as usize,
+                                job.height as usize,
+                            ) {
+                                Ok(c) => coder = Some(c),
+                                Err(err) => {
+                                    eprintln!("zed_record: the encoder: {err}; stopping");
+                                    STOP.store(true, Ordering::Relaxed);
+                                    return;
+                                }
+                            }
+                        }
+                        let coder = coder.as_ref().expect("made above");
                         let t0 = Instant::now();
                         let e = job.eye;
                         let frame_id = format!("zed_{}", EYES[e]);
                         (job.exposure.mean_level, job.exposure.saturated_fraction) =
                             meter(&job.data, job.width as usize);
-                        let msg = match encode(&job, encoding, quality, &frame_id) {
+                        let msg = match coder.encode(&mut job, &frame_id) {
                             Ok(m) => m,
                             Err(err) => {
                                 eprintln!("zed_record: encoding: {err}");
@@ -449,6 +501,22 @@ fn run(a: Args) -> Result<(), String> {
     let timing = camera
         .sensor_timing()
         .map_err(|m| format!("the sensors' timing: {m}"))?;
+    // The encoder works before anything is recorded (NVJPG needs JetPack's GStreamer plugins)
+    {
+        let (w, h) = (config.eye_width as usize, config.height as usize);
+        let coder = Coder::new(a.encoding, a.quality, w, h)?;
+        let mut probe = Job {
+            eye: 0,
+            stamp_ns: 0,
+            width: w as u32,
+            height: h as u32,
+            data: vec![128; w * h],
+            exposure: Exposure::default(),
+        };
+        coder
+            .encode(&mut probe, "probe")
+            .map_err(|e| format!("the {:?} encoder: {e}", a.encoding))?;
+    }
 
     // Recording starts with the first frame that has its pulse
     let waiting = Instant::now();
@@ -579,7 +647,7 @@ fn run(a: Args) -> Result<(), String> {
         },
         a.out.display(),
         a.encoding,
-        if a.encoding == Encoding::Jpeg {
+        if a.encoding != Encoding::Raw {
             format!(" q{}", a.quality)
         } else {
             String::new()
