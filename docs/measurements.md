@@ -395,19 +395,34 @@ zed_ros stamps the mid-exposure, the wrapper later in the frame: the age gain is
 --stereo ess --record --health, 60 s): node 29.6 fps, capture to command 59 ms (p90 64), camera
 frames lost 0.5 %, the recording 8.0 MB/s with NVJPG.
 
-### The camera lost frames under CPU load (open)
+### The camera lost frames under CPU load: monitoring tools delaying uvcvideo
 
-The same night, every build lost frames while the CPUs were busy, from the kernel (uvcvideo's
-sequence skipping 2 a frame, no bad buffers, no USB error logged then): in 40 s, 1 with 2 busy
-threads, 14-17 with 4, 22 with 6, none idle. The same with the busy loops at nice 19 or pinned
-away from CPU 0 (the USB host's interrupt), with or without the IMU, and with the build from
-before frame sync (14 with the sensors' sync output off, 32 with it on). On 2026-11-12 the same
-test had lost none with 6 busy threads. Not the power: LabOrin ran on a power bank (36 %), and on
-its wall supply after a reboot the same build lost 11 with 4 busy threads, the current one 13 with
-4, none with 6 and none idle; another 25 s with 4 lost 3, single frames at irregular times
-(8.9, 9.9, 24.2 s). So frames go missing when the CPUs are partly busy, 0-1.5 %, about the ZED
-SDK's own loss with pipeline_node alone (0.7-1.5 %). Not looked at yet (they need root): the CPUs'
-idle states, the USB host interrupt's affinity, uvcvideo's tracing; nor on the dog.
+Every build lost frames while the CPUs were partly busy (in 40 s: 1 with 2 busy threads, 11-25
+with 4, 0-22 with 6, none idle), from the kernel: uvcvideo's sequence skipping 2 a frame, no bad
+buffer, no USB error logged then. Not the power (a power bank and the wall supply alike), not
+frame sync, the IMU or the busy threads' priority or CPUs.
+
+How (uvcvideo's frame and statistics traces and ftrace's workqueue and scheduler events, root,
+LabOrin 2026-11-13): the camera itself aborts the frame. Part way through (after 10-85 of a
+frame's 113 payloads of ~32 KB) it sends a payload with the UVC error bit set; uvcvideo marks the
+frame bad and drops it, and a one-payload stub after it. For this bulk stream uvcvideo keeps 5
+transfers of 32 KB queued (~1.5 ms of data) and queues each again only after its copy work has
+run in a workqueue (an unbound, high-priority kernel worker). That work started within 0.004 ms
+(median; p99 0.013 ms), but now and then waited 1.5-6 ms, and 105 of the 119 waits over 1 ms came
+within 40 ms before an error bit: with no transfer queued, the camera's buffer overflows. During
+the long waits the worker's CPU ran ordinary tasks: jtop (109 ms in all), systemd (22),
+systemd-udevd (17), htop (8); the busy threads hardly at all.
+
+With the jtop service stopped and jtop's and htop's windows closed, the same tests lost nothing:
+0 of 4800 frames with 2, 4 and 6 busy threads (with the service alone still running: 1-2 in 40 s).
+The pipeline node on zed_ros with its recorder and health logger then lost 1 frame in 81 s (0.04
+%, against 0.5 % with jtop and htop running). A stand-in that wakes every 50 ms for 3 ms of plain
+user-mode work cost 2 frames in 40 s, and loops re-reading sysfs or procfs files 0-5 in 20 s: what
+jtop and htop do that holds the worker off is theirs (likely their system calls), not load as
+such. Not pinned down further. The ZED SDK reads the camera through the same uvcvideo.
+
+So: no jtop (service or window) or htop while recording or driving. A longer queue in uvcvideo
+(more transfers: a rebuilt module) or a real-time worker would make it robust; neither is done.
 
 ## Not measured
 
