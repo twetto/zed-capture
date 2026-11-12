@@ -134,15 +134,18 @@ fn run() -> Result<(), String> {
     if imu.is_some() {
         match camera.frame_sync() {
             Ok(was) => println!(
-                "frame marks: on (the sensors' sync output was {})",
-                if was == [true, true] {
-                    "already on"
-                } else {
-                    "off: turned on"
-                }
+                "frame marks: on (the left sensor's sync output was {})",
+                if was { "already on" } else { "off: turned on" }
             ),
             Err(e) => println!("frame marks: not turned on: {e}"),
         }
+    }
+    match camera.sensor_timing() {
+        Ok(t) => println!(
+            "sensors: chip {:#06x}, {} pixel clocks a line, {} lines a frame, output {}x{}",
+            t.chip_id, t.line_length, t.frame_length, t.output_width, t.output_height
+        ),
+        Err(e) => println!("sensors: {e}"),
     }
 
     let work = Duration::from_secs_f64(a.work_ms / 1e3);
@@ -268,11 +271,46 @@ fn run() -> Result<(), String> {
     if let Some(imu) = imu {
         sync.report(imu.frame_clock(), camera.arrival_periods());
     }
+    if let Some(e) = camera.exposure_stats() {
+        println!(
+            "exposure (the right sensor's): read {} times ({:.1}/s since opening), not answered {}, {} failed{}; a read {:.2} ms on average, at most {:.2} ms; line {}",
+            e.readings,
+            e.readings as f64 / (a.skip + a.seconds),
+            e.unanswered,
+            e.failures,
+            e.last_error
+                .map(|m| format!(" (last: {m})"))
+                .unwrap_or_default(),
+            e.total_read_ns as f64 / e.readings.max(1) as f64 / 1e6,
+            e.longest_read_ns as f64 / 1e6,
+            camera
+                .readout()
+                .map(|r| format!("{:.3} µs", r.line_ns / 1e3))
+                .unwrap_or("–".into())
+        );
+        sync.report_exposure();
+    }
     Ok(())
 }
 
 fn ms(ns: i64) -> String {
     format!("{:.3}", ns as f64 / 1e6)
+}
+
+fn quantiles(v: &mut [i64]) -> String {
+    if v.is_empty() {
+        return "–".into();
+    }
+    v.sort();
+    let p = |f: f64| v[((v.len() - 1) as f64 * f).round() as usize];
+    format!(
+        "min {} p10 {} median {} p90 {} max {} ms",
+        ms(v[0]),
+        ms(p(0.1)),
+        ms(p(0.5)),
+        ms(p(0.9)),
+        ms(*v.last().unwrap())
+    )
 }
 
 /// Each frame's pulse (by the MCU's clock) against its kernel stamp, and the marks against the
@@ -292,6 +330,12 @@ struct SyncCheck {
     pulses: std::collections::HashMap<u32, u64>,
     pending_marks: Vec<(u32, u64)>,
     prev: Option<(u32, u64, u32)>,
+    /// Each frame's exposure.
+    exposure: Vec<i64>,
+    /// Frames with a pulse and without an exposure.
+    exposure_missing: u64,
+    /// Mid-exposure − pulse.
+    mid_after_pulse: Vec<i64>,
 }
 
 impl SyncCheck {
@@ -309,6 +353,13 @@ impl SyncCheck {
         };
         self.synced += 1;
         self.arrival.push(frame.timestamp_ns as i64 - t as i64);
+        match frame.exposure_ns {
+            Some(e) => self.exposure.push(e as i64),
+            None => self.exposure_missing += 1,
+        }
+        if let Some(mid) = frame.mid_exposure_ns {
+            self.mid_after_pulse.push(mid as i64 - t as i64);
+        }
         if let Some((seq, pt, pcount)) = self.prev
             && frame.sequence.wrapping_sub(seq) == 1
         {
@@ -328,22 +379,21 @@ impl SyncCheck {
         self.pending_marks = kept;
     }
 
+    fn report_exposure(&mut self) {
+        println!(
+            "  frames with a mid-exposure {}, with a pulse and no exposure {}; exposure {}",
+            self.mid_after_pulse.len(),
+            self.exposure_missing,
+            quantiles(&mut self.exposure)
+        );
+        println!(
+            "  middle row's mid-exposure after the pulse: {}",
+            quantiles(&mut self.mid_after_pulse)
+        );
+    }
+
     fn report(&mut self, clock: Option<zed_capture::FrameClock>, arrival: Option<f64>) {
-        let q = |v: &mut Vec<i64>| -> String {
-            if v.is_empty() {
-                return "–".into();
-            }
-            v.sort();
-            let p = |f: f64| v[((v.len() - 1) as f64 * f).round() as usize];
-            format!(
-                "min {} p10 {} median {} p90 {} max {} ms",
-                ms(v[0]),
-                ms(p(0.1)),
-                ms(p(0.5)),
-                ms(p(0.9)),
-                ms(*v.last().unwrap())
-            )
-        };
+        let q = quantiles;
         match clock {
             Some(c) => println!(
                 "sync: {} of {} frames on the IMU's clock; fit of {} marks: period {:.4} ms ({:.4} by the MCU, whose clock runs {:+.0} ppm), marks up to {:.3} ms above the line; arrival learned {}",

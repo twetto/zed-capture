@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use std::{io, ptr};
 
 use crate::sys::{self, READ, WRITE, ioc};
+use crate::sensor::{EYES, Sensors};
 use crate::xu;
 
 // ---- The kernel's V4L2 structs (videodev2.h), 64-bit layouts ----
@@ -206,6 +207,13 @@ pub struct Frame {
     pub sync_time_ns: Option<u64>,
     /// The MCU's count of this frame, with `sync_time_ns`.
     pub mcu_frame_count: Option<u32>,
+    /// The exposure (ns), with `sync_time_ns`, as the auto exposure set it: the right sensor's,
+    /// which it gives the left too ([`Camera::next`](crate::Camera::next) says which reading).
+    pub exposure_ns: Option<u32>,
+    /// The middle of the exposure of the image's middle row (host ns), with `exposure_ns`: see
+    /// [`Camera::next`](crate::Camera::next). Rolling shutter: the other rows' come up to half a
+    /// readout (HD720: 14.5 ms) before and after it.
+    pub mid_exposure_ns: Option<u64>,
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
@@ -275,6 +283,7 @@ pub struct Video {
     // Unmapped before the device is closed: fields drop in this order.
     _maps: Arc<Vec<Mapping>>,
     file: File,
+    sensors: Sensors,
 }
 
 impl Video {
@@ -422,6 +431,7 @@ impl Video {
             fps,
             buffers: req.count,
             _maps: maps,
+            sensors: Sensors::new(file.try_clone()?),
             file,
         })
     }
@@ -500,38 +510,37 @@ impl Video {
         self.buffers
     }
 
-    /// Has both image sensors send their frame-start pulse to the camera's MCU, which then marks
-    /// the IMU sample of each frame ([`ImuSample::frame_sync`](crate::ImuSample::frame_sync)) and
-    /// counts the frames: each frame's time on the IMU's clock. Off when the camera powers up
-    /// (the ZED SDK turns it on, and it stays on until the camera is unplugged). Returns whether
-    /// it was already on, per eye.
-    pub fn enable_frame_sync(&self) -> io::Result<[bool; 2]> {
-        let fd = self.file.as_raw_fd();
-        let mut was_on = [false; 2];
-        for (eye, on) in was_on.iter_mut().enumerate() {
-            let what = |e: io::Error| {
-                context(
-                    e,
-                    &format!("the {} sensor's sync output", ["left", "right"][eye]),
-                )
-            };
-            let v = xu::read_sensor_register(fd, eye, xu::REG_SYNC_OUTPUT).map_err(what)?;
-            *on = v & xu::SYNC_OUTPUT_ON != 0;
-            if !*on {
-                xu::write_sensor_register(fd, eye, xu::REG_SYNC_OUTPUT, v | xu::SYNC_OUTPUT_ON)
-                    .map_err(what)?;
-                let back = xu::read_sensor_register(fd, eye, xu::REG_SYNC_OUTPUT).map_err(what)?;
-                if back & xu::SYNC_OUTPUT_ON == 0 {
-                    return Err(io::Error::other(format!(
-                        "the {} sensor's sync output: register {:#06x} reads {back:#04x} after writing {:#04x}",
-                        ["left", "right"][eye],
-                        xu::REG_SYNC_OUTPUT,
-                        v | xu::SYNC_OUTPUT_ON
-                    )));
-                }
-            }
+    /// Has image sensor `eye` send its frame-start pulse (VSYNC) out to the camera's MCU. The
+    /// MCU marks the IMU sample of each of the left sensor's pulses
+    /// ([`ImuSample::frame_sync`](crate::ImuSample::frame_sync)) and counts them: each frame's
+    /// time on the IMU's clock (LabOrin's ZED 2i, 2026-11-12: with the left's output off the
+    /// marks stop, with the right's they go on). Off when the camera powers up; the ZED SDK
+    /// turns both on, and they stay on until the camera is unplugged. Returns whether it was
+    /// already on. Each read is checked, and a sensor that does not answer (see
+    /// [`crate::sensor`]) asked again for up to `wait`.
+    pub fn enable_frame_sync(&self, eye: usize, wait: Duration) -> io::Result<bool> {
+        let what = |e: io::Error| context(e, &format!("the {} sensor's sync output", EYES[eye]));
+        let s = &self.sensors;
+        let v = s.read_checked(eye, xu::REG_SYNC_OUTPUT, wait).map_err(what)?;
+        if v & xu::SYNC_OUTPUT_ON != 0 {
+            return Ok(true);
         }
-        Ok(was_on)
+        s.write(eye, xu::REG_SYNC_OUTPUT, v | xu::SYNC_OUTPUT_ON).map_err(what)?;
+        let back = s.read_checked(eye, xu::REG_SYNC_OUTPUT, wait).map_err(what)?;
+        if back & xu::SYNC_OUTPUT_ON == 0 {
+            return Err(io::Error::other(format!(
+                "the {} sensor's sync output: register {:#06x} reads {back:#04x} after writing {:#04x}",
+                EYES[eye],
+                xu::REG_SYNC_OUTPUT,
+                v | xu::SYNC_OUTPUT_ON
+            )));
+        }
+        Ok(false)
+    }
+
+    /// The image sensors' registers (a handle other threads can keep).
+    pub fn sensors(&self) -> &Sensors {
+        &self.sensors
     }
 }
 
@@ -625,6 +634,8 @@ impl Capture {
                     right,
                     sync_time_ns: None,
                     mcu_frame_count: None,
+                    exposure_ns: None,
+                    mid_exposure_ns: None,
                     pool: self.pool.clone(),
                 })
             } else {

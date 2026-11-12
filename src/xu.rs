@@ -54,16 +54,21 @@ fn query(fd: RawFd, request: u8, data: &mut [u8]) -> io::Result<()> {
     sys::ioctl(fd, UVCIOC_CTRL_QUERY, &mut q)
 }
 
-fn request(fd: RawFd, buf: &mut [u8; REQUEST_LEN], read: bool) -> io::Result<()> {
+/// The length of the extension unit's requests (384 bytes over USB 3, 64 over USB 2).
+pub fn request_len(fd: RawFd) -> io::Result<usize> {
     let mut len = [0u8; 2];
     query(fd, UVC_GET_LEN, &mut len)
         .map_err(|e| io::Error::new(e.kind(), format!("the camera's extension unit: {e}")))?;
     let len = u16::from_le_bytes(len) as usize;
-    if len == 0 || len > REQUEST_LEN {
+    if !(18..=REQUEST_LEN).contains(&len) {
         return Err(io::Error::other(format!(
             "the camera's extension unit takes {len} bytes"
         )));
     }
+    Ok(len)
+}
+
+fn request(fd: RawFd, len: usize, buf: &mut [u8; REQUEST_LEN], read: bool) -> io::Result<()> {
     query(fd, UVC_SET_CUR, &mut buf[..len])?;
     std::thread::sleep(Duration::from_micros(300));
     if read {
@@ -86,17 +91,26 @@ fn sensor_request(task: u8, eye: usize, register: u16) -> [u8; REQUEST_LEN] {
     b
 }
 
-/// One byte of an image sensor's register (`eye` 0 left, 1 right).
-pub fn read_sensor_register(fd: RawFd, eye: usize, register: u16) -> io::Result<u8> {
+/// One byte of an image sensor's register (`eye` 0 left, 1 right), with requests of `len`
+/// ([`request_len`]). 0xff when the sensor does not answer: when it is not streaming, and for
+/// spans of ~0.6 s every few seconds on the left sensor of LabOrin's ZED 2i while it streams
+/// (2026-11-12; the right's always answered).
+pub fn read_sensor_register(fd: RawFd, len: usize, eye: usize, register: u16) -> io::Result<u8> {
     let mut b = sensor_request(TASK_GET, eye, register);
-    request(fd, &mut b, true)?;
+    request(fd, len, &mut b, true)?;
     Ok(b[17])
 }
 
-pub fn write_sensor_register(fd: RawFd, eye: usize, register: u16, value: u8) -> io::Result<()> {
+pub fn write_sensor_register(
+    fd: RawFd,
+    len: usize,
+    eye: usize,
+    register: u16,
+    value: u8,
+) -> io::Result<()> {
     let mut b = sensor_request(TASK_SET, eye, register);
     b[16] = value;
-    request(fd, &mut b, false)
+    request(fd, len, &mut b, false)
 }
 
 #[cfg(test)]

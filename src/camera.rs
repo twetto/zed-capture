@@ -5,20 +5,60 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::sensor::{ExposureMonitor, ExposureReading, ExposureStats, SensorTiming};
 use crate::{FrameClock, Imu, ImuSample, Video, VideoConfig, find};
 
 /// Marks in the fit before frames are given their pulse (1 s at 30 Hz).
 const MIN_MARKS: usize = 30;
+/// The longest after the newest mark that a frame is given a pulse (ns): further, the marks
+/// have stopped (the left sensor's sync output turned off, say).
+const MAX_SINCE_MARK_NS: f64 = 1e9;
+/// The sensor whose pulses the MCU marks: the left (see [`Video::enable_frame_sync`]).
+const MARKED_EYE: usize = 0;
+/// The sensor whose exposure is read: the right. The left's registers often do not answer
+/// ([`crate::sensor`]), and the auto exposure gives both the same exposure (but for a few
+/// seconds after the stream starts: LabOrin, the left 779 lines, the right 747, for 4 s).
+const EXPOSURE_EYE: usize = 1;
 /// Frames whose arrival after the pulse is averaged before it is used.
 const ARRIVAL_FRAMES: usize = 15;
+/// From a frame's sync pulse to the sensor's first output row being read (ns). Not measured:
+/// taken as 0, the pulse being the sensor's frame start (VSYNC), and the kernel stamp coming
+/// 1.1-1.7 ms after it with the first data. The image's time against `mid_exposure_ns`, from
+/// the camera turned by hand against the gyro, measures it.
+pub const PULSE_TO_READOUT_NS: f64 = 0.0;
+
+/// When a frame's rows are read, from its sync pulse: a rolling shutter, row after row.
+#[derive(Clone, Copy, Debug)]
+pub struct Readout {
+    /// One line of the sensor (ns): the frame period over the sensor's lines per frame.
+    pub line_ns: f64,
+    /// The sensor's output rows before the image's first (the camera crops the rows it does not
+    /// send evenly, assumed: HD720, 724 rows to 720).
+    pub rows_before_image: f64,
+    /// See [`PULSE_TO_READOUT_NS`].
+    pub pulse_to_readout_ns: f64,
+}
+
+impl Readout {
+    /// From the pulse to the image's middle row being read (ns), which ends its exposure. The
+    /// same whichever way up the sensor reads.
+    pub fn middle_row_ns(&self, image_rows: usize) -> f64 {
+        self.pulse_to_readout_ns
+            + (self.rows_before_image + (image_rows as f64 - 1.0) / 2.0) * self.line_ns
+    }
+}
 
 /// The camera's video and, optionally, its IMU.
 pub struct Camera {
     // The IMU's stream is turned off before the video's.
     imu: Option<Imu>,
+    // The exposure's thread is stopped before the video too.
+    exposure: Option<ExposureMonitor>,
     video: Video,
-    frame_sync: Result<[bool; 2], String>,
+    frame_sync: Result<bool, String>,
     arrival: Mutex<Arrival>,
+    /// The sensors' timing, read once (the right's, or the left's if the right did not answer).
+    timing: Result<SensorTiming, String>,
 }
 
 /// How much each frame moves the arrival once it is known.
@@ -64,7 +104,8 @@ impl Camera {
 
     /// Opens the video and, once its first frame has come, the IMU if `hid` is given (sooner,
     /// the video can stop; see [`Video::open`]), then turns the frame marks on
-    /// ([`Video::enable_frame_sync`]; see [`Camera::frame_sync`]).
+    /// ([`Video::enable_frame_sync`]; see [`Camera::frame_sync`]): the left sensor's pulse,
+    /// waiting up to 5 s for it to answer, and the right's too, as the ZED SDK does.
     pub fn open(video: &Path, hid: Option<&Path>, config: VideoConfig) -> io::Result<Camera> {
         let video = Video::open(video, config)?;
         if hid.is_some() {
@@ -72,20 +113,51 @@ impl Camera {
         }
         let imu = hid.map(Imu::open).transpose()?;
         let frame_sync = match imu {
-            Some(_) => video.enable_frame_sync().map_err(|e| e.to_string()),
+            Some(_) => {
+                let left = video.enable_frame_sync(MARKED_EYE, Duration::from_secs(5));
+                // Not marked: its failure is not the marks'.
+                let _ = video.enable_frame_sync(1 - MARKED_EYE, Duration::from_secs(1));
+                left.map_err(|e| e.to_string())
+            }
             None => Err("no IMU".into()),
+        };
+        let sensors = video.sensors();
+        let timing = sensors
+            .timing(EXPOSURE_EYE, Duration::from_secs(1))
+            .or_else(|_| sensors.timing(1 - EXPOSURE_EYE, Duration::from_secs(1)))
+            .map_err(|e| format!("the sensors' timing: {e}"))
+            .and_then(|t| {
+                if !(1..4096).contains(&t.frame_length)
+                    || t.output_height < video.config().height as u16
+                {
+                    Err(format!("the sensors' timing does not fit the stream: {t:?}"))
+                } else {
+                    Ok(t)
+                }
+            });
+        let exposure = match &timing {
+            Ok(t) => Some(ExposureMonitor::start(
+                sensors.clone(),
+                EXPOSURE_EYE,
+                Duration::from_secs_f64(1.0 / video.fps()),
+                t.frame_length as u32,
+            )?),
+            Err(_) => None,
         };
         Ok(Camera {
             imu,
             video,
             frame_sync,
             arrival: Mutex::new(Arrival::default()),
+            timing,
+            exposure,
         })
     }
 
-    /// Whether the MCU marks each frame's IMU sample: Ok with whether each sensor's sync output
-    /// was already on, or why it could not be turned on.
-    pub fn frame_sync(&self) -> Result<[bool; 2], &str> {
+    /// Whether the MCU marks each frame's IMU sample: Ok with whether the left sensor's sync
+    /// output was already on, or why it could not be turned on (the marks still come if it was
+    /// on: [`Camera::next`] goes by the marks that come).
+    pub fn frame_sync(&self) -> Result<bool, &str> {
         self.frame_sync.as_ref().copied().map_err(|e| e.as_str())
     }
 
@@ -97,8 +169,17 @@ impl Camera {
     /// it by that clock: camera and IMU on one hardware clock. Each frame is matched to the
     /// pulse that came a steady time before its kernel stamp (LabOrin's ZED 2i: 1.2-1.5 ms),
     /// learned over the first frames, followed after, and taken to be under one frame period.
-    /// Before that (the first ~3 s: the MCU clock's rate takes two seconds), and without marks,
-    /// the samples read up to the frame's kernel stamp.
+    /// Before that (the first ~3 s: the MCU clock's rate takes two seconds), without marks, and
+    /// over a second after the newest mark, the samples read up to the frame's kernel stamp.
+    ///
+    /// With its pulse, the frame gets the exposure ([`crate::Frame::exposure_ns`]) and the
+    /// middle of the exposure of the image's middle row ([`crate::Frame::mid_exposure_ns`]):
+    /// the pulse, plus the readout to that row ([`Readout`]), less half the exposure. The
+    /// exposure is the right sensor's (which the auto exposure gives both), its registers'
+    /// newest answer (read once a frame, in a thread of its own) from before the previous
+    /// frame's pulse, and at most 1 s before: OmniVision's sensors take a new exposure at a
+    /// frame's start, for the frame after. While the auto exposure changes, it may be a frame
+    /// off; [`Camera::drain_exposure`] has every reading.
     pub fn next(&self, timeout: Duration) -> io::Result<Option<(crate::Frame, Vec<ImuSample>)>> {
         let Some(mut frame) = self.video.next(timeout)? else {
             return Ok(None);
@@ -106,11 +187,20 @@ impl Camera {
         let Some(imu) = &self.imu else {
             return Ok(Some((frame, Vec::new())));
         };
-        if let Some(clock) = imu.frame_clock().filter(|c| c.marks >= MIN_MARKS)
-            && let Some((time, count)) = self.pulse_of(&clock, frame.timestamp_ns)
+        if let Some(clock) = imu.frame_clock().filter(|c| {
+            c.marks >= MIN_MARKS && frame.timestamp_ns as f64 - c.host_ns <= MAX_SINCE_MARK_NS
+        }) && let Some((time, count)) = self.pulse_of(&clock, frame.timestamp_ns)
         {
             frame.sync_time_ns = Some(time);
             frame.mcu_frame_count = Some(count);
+            if let Some(readout) = self.readout_with(&clock)
+                && let Some(lines) = self.exposure_at(time as f64 - clock.period_ns)
+            {
+                let e = (lines as f64 * readout.line_ns).round();
+                frame.exposure_ns = Some(e as u32);
+                let mid = time as f64 + readout.middle_row_ns(frame.height) - e / 2.0;
+                frame.mid_exposure_ns = Some(mid.round() as u64);
+            }
             let samples = imu.drain_until_time(time)?;
             return Ok(Some((frame, samples)));
         }
@@ -125,6 +215,41 @@ impl Camera {
         let frames = (x - arrival).round() as i64;
         let time = clock.host_ns_after(frames);
         (time > 0.0).then(|| (time as u64, clock.count.wrapping_add(frames as u32)))
+    }
+
+    fn exposure_at(&self, time_ns: f64) -> Option<f32> {
+        self.exposure.as_ref()?.at(time_ns.max(0.0) as u64)
+    }
+
+    fn readout_with(&self, clock: &FrameClock) -> Option<Readout> {
+        let t = self.timing.as_ref().ok()?;
+        Some(Readout {
+            line_ns: clock.period_ns / t.frame_length as f64,
+            rows_before_image: (t.output_height as f64 - self.video.config().height as f64) / 2.0,
+            pulse_to_readout_ns: PULSE_TO_READOUT_NS,
+        })
+    }
+
+    /// When the rows are read, once the frame marks are fitted (the line time is the frame
+    /// period by the IMU's clock over the sensor's lines per frame).
+    pub fn readout(&self) -> Option<Readout> {
+        let clock = self.imu.as_ref()?.frame_clock()?;
+        self.readout_with(&clock)
+    }
+
+    /// The sensors' timing registers, read when the camera opened, or why they could not be.
+    pub fn sensor_timing(&self) -> Result<SensorTiming, &str> {
+        self.timing.as_ref().copied().map_err(|e| e.as_str())
+    }
+
+    /// The right sensor's exposure readings since the last call (up to 4096 kept), oldest
+    /// first.
+    pub fn drain_exposure(&self) -> Vec<ExposureReading> {
+        self.exposure.as_ref().map(|m| m.drain()).unwrap_or_default()
+    }
+
+    pub fn exposure_stats(&self) -> Option<ExposureStats> {
+        self.exposure.as_ref().map(|m| m.stats())
     }
 
     /// How long after its pulse a frame's kernel stamp comes, in frame periods, once learned.
@@ -144,6 +269,18 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn middle_row_from_the_line_time() {
+        // LabOrin's ZED 2i at HD720: 832 lines in 33.335 ms, 724 rows output for 720
+        let r = Readout {
+            line_ns: 33.335e6 / 832.0,
+            rows_before_image: 2.0,
+            pulse_to_readout_ns: 0.0,
+        };
+        let ms = r.middle_row_ns(720) / 1e6;
+        assert!((ms - 14.484).abs() < 0.001, "{ms}");
+    }
 
     #[test]
     fn arrival_averages_around_the_wrap() {

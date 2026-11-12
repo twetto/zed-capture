@@ -10,9 +10,13 @@
 //!
 //! --imu: through `Camera`, with the frame marks on. OUT/frames.csv, one line per frame after
 //! --skip: its kernel stamp, its sync pulse on the IMU's clock (empty before the marks are
-//! fitted), the MCU's count of it, whether its images were saved. OUT/imu.csv: every sample after
-//! --skip, its time on the host's clock by the MCU's (`time_ns`), its MCU and read times, gyro
-//! (rad/s), accel (m/s²), the frame mark and the MCU's frame count.
+//! fitted), the MCU's count of it, whether its images were saved, the exposure and the middle of
+//! the exposure of the image's middle row (`Frame::mid_exposure_ns`). OUT/imu.csv:
+//! every sample after --skip, its time on the host's clock by the MCU's (`time_ns`), its MCU and
+//! read times, gyro (rad/s), accel (m/s²), the frame mark and the MCU's frame count.
+//! OUT/exposure.csv: every reading of the right sensor's exposure registers, when it began (host
+//! ns), how long it took, the exposure in lines (empty when it did not answer). OUT/readout.csv: the line time and the rows
+//! the mid-exposure times were figured with (`Readout`) and the sensor's lines per frame.
 
 use std::fs;
 use std::io::{self, Write};
@@ -144,13 +148,18 @@ fn run(a: Args) -> io::Result<()> {
     }
     let mut csv = if a.imu {
         let mut frames = io::BufWriter::new(fs::File::create(a.out.join("frames.csv"))?);
-        writeln!(frames, "kernel_ns,sync_ns,mcu_count,saved")?;
+        writeln!(
+            frames,
+            "kernel_ns,sync_ns,mcu_count,saved,exposure_ns,mid_exposure_ns"
+        )?;
         let mut imu = io::BufWriter::new(fs::File::create(a.out.join("imu.csv"))?);
         writeln!(
             imu,
             "time_ns,mcu_ns,read_ns,gx,gy,gz,ax,ay,az,frame_sync,frame_count"
         )?;
-        Some((frames, imu))
+        let mut exposure = io::BufWriter::new(fs::File::create(a.out.join("exposure.csv"))?);
+        writeln!(exposure, "time_ns,read_ns,lines")?;
+        Some((frames, imu, exposure))
     } else {
         None
     };
@@ -164,16 +173,22 @@ fn run(a: Args) -> io::Result<()> {
         }
         seen += 1;
         let save = (seen - 1) % a.every == 0;
-        if let Some((frames, imu)) = &mut csv {
+        if let (Some((frames, imu, exposure)), Source::Camera(camera)) = (&mut csv, &source) {
             let opt = |v: Option<u64>| v.map(|v| v.to_string()).unwrap_or_default();
             writeln!(
                 frames,
-                "{},{},{},{}",
+                "{},{},{},{},{},{}",
                 frame.timestamp_ns,
                 opt(frame.sync_time_ns),
                 opt(frame.mcu_frame_count.map(u64::from)),
-                save as u8
+                save as u8,
+                opt(frame.exposure_ns.map(u64::from)),
+                opt(frame.mid_exposure_ns)
             )?;
+            for r in camera.drain_exposure() {
+                let lines = r.lines.map(|l| format!("{l:.4}")).unwrap_or_default();
+                writeln!(exposure, "{},{},{lines}", r.time_ns, r.read_ns)?;
+            }
             synced += frame.sync_time_ns.is_some() as usize;
             for s in &samples {
                 writeln!(
@@ -212,9 +227,25 @@ fn run(a: Args) -> io::Result<()> {
         }
         saved += 1;
     }
-    if let Some((mut frames, mut imu)) = csv {
+    if let Some((mut frames, mut imu, mut exposure)) = csv {
         frames.flush()?;
         imu.flush()?;
+        exposure.flush()?;
+    }
+    if let Source::Camera(camera) = &source
+        && let (Some(r), Ok(timing)) = (camera.readout(), camera.sensor_timing())
+    {
+        fs::write(
+            a.out.join("readout.csv"),
+            format!(
+                "line_ns,rows_before_image,pulse_to_readout_ns,frame_length,output_height\n{:.3},{},{},{},{}\n",
+                r.line_ns,
+                r.rows_before_image,
+                r.pulse_to_readout_ns,
+                timing.frame_length,
+                timing.output_height
+            ),
+        )?;
     }
     let s = source.video().stats();
     println!(
