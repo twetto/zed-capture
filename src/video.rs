@@ -219,6 +219,9 @@ pub struct VideoConfig {
     /// reads (`docs/measurements.md`). The right sensor's are read alone, its exposure close to
     /// the left's (the same in dim light; apart in bright light).
     pub read_left_exposure: bool,
+    /// zed-capture's own auto exposure in place of the camera's ([`crate::auto_exposure`]):
+    /// both eyes one exposure, each its own gain. None (the default): the camera's.
+    pub active_exposure: Option<crate::AutoExposureConfig>,
 }
 
 impl Default for VideoConfig {
@@ -232,8 +235,25 @@ impl Default for VideoConfig {
             mains_hz: None,
             read_exposure: true,
             read_left_exposure: false,
+            active_exposure: None,
         }
     }
+}
+
+/// Where a frame's exposure for an eye came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExposureSource {
+    /// Not known.
+    #[default]
+    None,
+    /// The eye's sensor's registers, as the camera's auto exposure set them.
+    Read,
+    /// A manual exposure ([`Video::set_manual_exposure`]).
+    Manual,
+    /// zed-capture's own auto exposure, written and read back.
+    Active,
+    /// zed-capture's own auto exposure, written but not read back (after retries).
+    ActiveUnchecked,
 }
 
 /// One stereo frame: left and right grey (the Y bytes), each `width × height`, row-major.
@@ -264,6 +284,8 @@ pub struct Frame {
     /// Each eye's raw gain (the OV4689's register, in [`crate::sensor::GAIN_RANGES`]; not a
     /// multiplier), read with its exposure.
     pub gain: [Option<u16>; 2],
+    /// Where each eye's exposure and gain came from.
+    pub exposure_source: [ExposureSource; 2],
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
@@ -664,6 +686,21 @@ impl Video {
         Ok(())
     }
 
+    /// Turns the camera's auto exposure and gain off (each eye's ISP), and waits 5 frames if it
+    /// was on: the ISP can still apply an update it had pending. It comes back on when the video
+    /// is dropped, or with [`Video::set_auto_exposure`].
+    pub(crate) fn take_exposure_control(&self) -> io::Result<()> {
+        let was_on = self.auto_exposure()?;
+        self.turned_auto_off.store(true, Ordering::Relaxed);
+        for eye in 0..2 {
+            self.sensors.set_auto_exposure(eye, false)?;
+        }
+        if was_on.contains(&true) {
+            std::thread::sleep(Duration::from_secs_f64(5.0 / self.fps));
+        }
+        Ok(())
+    }
+
     /// The manual exposure set by [`Video::set_manual_exposure`], until the auto exposure is
     /// back on.
     pub fn manual_exposure(&self) -> Option<ManualExposure> {
@@ -691,15 +728,8 @@ impl Video {
         let line_ns = 1e9 / self.fps / timing.frame_length as f64;
         let max = (timing.frame_length as u32).saturating_sub(EXPOSURE_MARGIN_LINES);
         let lines = ((exposure.as_nanos() as f64 / line_ns).round() as u32).clamp(1, max);
-        let was_on = self.auto_exposure()?;
         *self.manual.lock().unwrap() = None;
-        self.turned_auto_off.store(true, Ordering::Relaxed);
-        for eye in 0..2 {
-            self.sensors.set_auto_exposure(eye, false)?;
-        }
-        if was_on.contains(&true) {
-            std::thread::sleep(Duration::from_secs_f64(5.0 / self.fps));
-        }
+        self.take_exposure_control()?;
         for (eye, name) in EYES.iter().enumerate() {
             let what = |e: io::Error| context(e, &format!("the {name} sensor's exposure"));
             self.sensors
@@ -817,6 +847,7 @@ impl Capture {
                     exposure_ns: [None; 2],
                     mid_exposure_ns: [None; 2],
                     gain: [None; 2],
+                    exposure_source: [ExposureSource::None; 2],
                     pool: self.pool.clone(),
                 })
             } else {

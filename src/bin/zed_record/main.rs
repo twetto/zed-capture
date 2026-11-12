@@ -3,7 +3,7 @@
 //!
 //!   zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|nvjpg|raw] [--quality 90] [--every 1]
 //!                       [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--seconds S] [--encoders N]
-//!                       [--no-exposure-reads] [--read-left]
+//!                       [--no-exposure-reads] [--read-left] [--active-exposure [mean|gradient]]
 //!
 //! Each image is stamped at its eye's middle row's mid-exposure, its `CameraExposure` beside it
 //! with the same stamp; `/zed/frame_timing` has every frame's pulse, both eyes' exposure and gain,
@@ -14,6 +14,10 @@
 //! IMU always); --encoders the threads encoding images (default: one per eye recorded). Only the
 //! right sensor's exposure is read (the left image takes it), unless --read-left: reading the left
 //! sensor disturbs the camera's own exposure writes. --no-exposure-reads reads neither.
+//! --active-exposure: zed-capture's own auto exposure instead of the camera's (both eyes one
+//! exposure, each its own gain, every setting known; past one flicker period of the --mains
+//! lights, whole periods), in its mean mode (a target brightness) or gradient mode (the most image
+//! gradient).
 //!
 //! If the video stops (no frame for 3 s: the camera went silent, or was unplugged), the camera is
 //! opened again and the recording goes on in the same file, from its first frame with a pulse;
@@ -38,10 +42,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use msgs::{Exposure, FrameTiming, Source};
-use zed_capture::{Camera, Devices, Frame, ManualExposure, VideoConfig, find, monotonic_ns};
+use zed_capture::{
+    AutoExposureConfig, Camera, Devices, ExposureSource, Frame, GradientConfig, ManualExposure,
+    VideoConfig, find, monotonic_ns,
+};
 
 const EYES: [&str; 2] = ["left", "right"];
-const USAGE: &str = "usage: zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|nvjpg|raw] [--quality 90] [--every 1] [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--seconds S] [--encoders N] [--no-exposure-reads] [--read-left]";
+const USAGE: &str = "usage: zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|nvjpg|raw] [--quality 90] [--every 1] [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--seconds S] [--encoders N] [--no-exposure-reads] [--read-left] [--active-exposure [mean|gradient]]";
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static REOPEN: AtomicBool = AtomicBool::new(false);
@@ -74,6 +81,13 @@ struct Args {
     encoders: Option<usize>,
     read_exposure: bool,
     read_left: bool,
+    active: Option<ActiveMode>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ActiveMode {
+    Mean,
+    Gradient,
 }
 
 fn args() -> Result<Args, String> {
@@ -90,9 +104,10 @@ fn args() -> Result<Args, String> {
         encoders: None,
         read_exposure: true,
         read_left: false,
+        active: None,
     };
     let mut out = None;
-    let mut it = std::env::args().skip(1);
+    let mut it = std::env::args().skip(1).peekable();
     while let Some(arg) = it.next() {
         if !arg.starts_with("--") {
             if out.replace(PathBuf::from(&arg)).is_some() {
@@ -106,6 +121,15 @@ fn args() -> Result<Args, String> {
         }
         if arg == "--read-left" {
             a.read_left = true;
+            continue;
+        }
+        if arg == "--active-exposure" {
+            a.active = Some(
+                match it.next_if(|v| v == "mean" || v == "gradient").as_deref() {
+                    Some("gradient") => ActiveMode::Gradient,
+                    _ => ActiveMode::Mean,
+                },
+            );
             continue;
         }
         let value = it.next().ok_or(format!("{arg} needs a value"))?;
@@ -588,6 +612,12 @@ fn run(a: Args) -> Result<(), String> {
         mains_hz: a.mains_hz,
         read_exposure: a.read_exposure,
         read_left_exposure: a.read_left,
+        // Exposures past one flicker period of the lights keep to whole periods: twice the mains
+        active_exposure: a.active.map(|mode| AutoExposureConfig {
+            flicker_hz: a.mains_hz.filter(|&h| h > 0).map(|h| 2.0 * h as f64),
+            gradient: (mode == ActiveMode::Gradient).then(GradientConfig::default),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let opened = match open_camera(&a, &config, Duration::from_secs(15)) {
@@ -656,6 +686,22 @@ fn run(a: Args) -> Result<(), String> {
                 m.lines,
                 m.exposure_ns / 1e6,
                 m.gain
+            ),
+            None if a.active.is_some() => format!(
+                "zed-capture's active exposure, {}, at most 25 ms, {}; one exposure for both \
+                 eyes, each eye's own gain",
+                match a.active {
+                    Some(ActiveMode::Gradient) => {
+                        "the gradient mode of v4l2_trigger_camera's (the most image gradient, \
+                         predicted through the ZED's measured tone curve; gain past the cap only \
+                         below level 60)"
+                    }
+                    _ => "the mean mode of v4l2_trigger_camera's: target level 100",
+                },
+                match a.mains_hz.filter(|&h| h > 0) {
+                    Some(h) => format!("whole periods of the {}-Hz flicker past one", 2 * h),
+                    None => "not kept to the lights' flicker (no --mains)".into(),
+                }
             ),
             None => "the camera's auto exposure, each eye's own".into(),
         },
@@ -853,10 +899,11 @@ fn run(a: Args) -> Result<(), String> {
         let mut eye_exposure = [None; 2];
         for eye in 0..2 {
             if let (Some(ex), Some(g)) = (f.exposure_ns[eye], f.gain[eye]) {
-                let source = if manual.is_some() {
-                    Source::Manual
-                } else {
-                    Source::Own
+                let source = match f.exposure_source[eye] {
+                    ExposureSource::Manual => Source::Manual,
+                    ExposureSource::Active => Source::Active,
+                    ExposureSource::ActiveUnchecked => Source::ActiveUnchecked,
+                    _ => Source::Own,
                 };
                 eye_exposure[eye] = Some((ex as f64, g, source));
                 last_known[eye] = Some((ex as f64, g));
@@ -868,7 +915,7 @@ fn run(a: Args) -> Result<(), String> {
             }
             let gain = last_known[eye].map(|(_, g)| g).unwrap_or(0);
             eye_exposure[eye] = match (eye_exposure[1 - eye], last_known[eye]) {
-                (Some((ex, _, Source::Own | Source::Manual)), _) => {
+                (Some((ex, _, Source::Own | Source::Manual | Source::Active)), _) => {
                     Some((ex, gain, Source::OtherEye))
                 }
                 (_, Some((ex, _))) => Some((ex, gain, Source::LastKnown)),
@@ -930,7 +977,10 @@ fn run(a: Args) -> Result<(), String> {
                     exposure_us: (ex / 1e3) as f32,
                     exposure_lines: (ex / readout.line_ns).round() as u32,
                     analogue_gain: gain as u32,
-                    exposure_measured: matches!(source, Source::Own | Source::Manual),
+                    exposure_measured: matches!(
+                        source,
+                        Source::Own | Source::Manual | Source::Active
+                    ),
                     auto_exposure: manual.is_none(),
                     ..Default::default()
                 },
@@ -976,6 +1026,35 @@ fn run(a: Args) -> Result<(), String> {
         ),
     );
     put("stalls", stalls.len().to_string());
+    if let Some(x) = camera.as_ref().and_then(|c| c.active_exposure_stats()) {
+        put(
+            "active_exposure",
+            format!(
+                "{} steps, {} writes, not read back left {} right {}, {} write errors{}; \
+                 controller {:.2} ms a step, at most {:.2}",
+                x.steps,
+                x.writes,
+                x.unverified[0],
+                x.unverified[1],
+                x.write_errors,
+                x.last_error
+                    .map(|e| format!(" (last: {e})"))
+                    .unwrap_or_default(),
+                x.step_ns_total as f64 / x.steps.max(1) as f64 / 1e6,
+                x.step_ns_max as f64 / 1e6,
+            ),
+        );
+        if let Some([curve, linear, unchanged]) = x.prediction.means() {
+            put(
+                "tone_curve_check",
+                format!(
+                    "frames after a step predicted from the frame before, mean |error| over {} \
+                     pixels: the tone curve {curve:.2}, linear {linear:.2}, no change {unchanged:.2}",
+                    x.prediction.pixels
+                ),
+            );
+        }
+    }
     for (i, st) in stalls.iter().enumerate() {
         put(&format!("stall_{}", i + 1), st.clone());
     }

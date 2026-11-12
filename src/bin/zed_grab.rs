@@ -119,8 +119,8 @@ fn write_pgm(path: &Path, width: usize, height: usize, grey: &[u8]) -> io::Resul
 
 /// Where the frames come from: the video alone, or the camera with its IMU.
 enum Source {
-    Video(Video),
-    Camera(Camera),
+    Video(Box<Video>),
+    Camera(Box<Camera>),
 }
 
 impl Source {
@@ -148,10 +148,13 @@ fn run(a: Args) -> io::Result<()> {
         ..Default::default()
     };
     let (source, serial) = match (&a.video, a.imu) {
-        (Some(v), _) => (Source::Video(Video::open(v, config)?), None),
+        (Some(v), _) => (Source::Video(Box::new(Video::open(v, config)?)), None),
         (None, false) => {
             let d = find()?;
-            (Source::Video(Video::open(&d.video, config)?), d.serial)
+            (
+                Source::Video(Box::new(Video::open(&d.video, config)?)),
+                d.serial,
+            )
         }
         (None, true) => {
             let d = find()?;
@@ -159,7 +162,7 @@ fn run(a: Args) -> io::Result<()> {
             if let Err(e) = camera.frame_sync() {
                 eprintln!("zed_grab: no frame marks ({e}): frames.csv without sync times");
             }
-            (Source::Camera(camera), d.serial)
+            (Source::Camera(Box::new(camera)), d.serial)
         }
     };
     if let Some(ms) = a.exposure_ms {

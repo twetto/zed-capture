@@ -58,6 +58,16 @@ manual exposure, both eyes are known exactly.
 exposure and a raw gain on both sensors, as zed-open-capture does. The auto exposure comes back on
 when the video is dropped; if the process dies first, it stays off until the camera is unplugged.
 
+**Active exposure.** `VideoConfig::active_exposure` runs zed-capture's own auto exposure instead
+of the camera's: one exposure for both eyes (so both images share their timing), each eye's own
+gain, every frame's setting known exactly. Past one flicker period of the lights (`flicker_hz`)
+exposures keep to whole periods. Two modes, both `v4l2_trigger_camera`'s: the mean mode holds a
+target brightness; the gradient mode (`AutoExposureConfig::gradient`) goes for the most image
+gradient, predicting the image after each step through the ZED's measured tone curve, and raises
+gain only for a dark frame. In the lab both tracked as well as each other and the camera's own
+(docs/measurements.md); the mean mode is the default, at a tenth of the gradient mode's cost. The
+camera's auto exposure comes back on when the video is dropped.
+
 **Mains.** The camera powers up with its anti-flicker at 50 Hz. Where the mains are 60 Hz, set
 `VideoConfig::mains_hz` to 60: the auto exposure then keeps to whole periods of the lights'
 flicker.
@@ -96,6 +106,7 @@ time).
 ```
 zed_record OUT.mcap [--eyes both|left|right] [--encoding jpeg|nvjpg|raw] [--quality 90]
                     [--every 1] [--mains 50|60] [--exposure-ms MS [--gain RAW]] [--seconds S]
+                    [--active-exposure [mean|gradient]]
 ```
 
 Records the images, IMU and frame timing into one MCAP file of ROS 2 messages, with their

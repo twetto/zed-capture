@@ -16,6 +16,8 @@
 //! zed-open-capture (MIT). Unlike it and the SDK, nothing here keeps only the newest frame or
 //! sample.
 
+mod active_exposure;
+pub mod auto_exposure;
 pub mod camera;
 pub mod clock;
 pub mod device;
@@ -25,12 +27,14 @@ mod sys;
 pub mod video;
 mod xu;
 
+pub use active_exposure::ActiveStats;
+pub use auto_exposure::{AutoExposureConfig, GradientConfig, PredictionCheck, ToneCurve};
 pub use camera::Camera;
 pub use clock::FrameClock;
 pub use device::{Devices, find, reattach_hid};
 pub use imu::{Imu, ImuSample, ImuStats};
 pub use sensor::{ExposureReading, ExposureStats, SensorTiming, Sensors, gain_multiplier};
-pub use video::{Frame, ManualExposure, Video, VideoConfig, VideoStats};
+pub use video::{ExposureSource, Frame, ManualExposure, Video, VideoConfig, VideoStats};
 
 /// `CLOCK_MONOTONIC` in nanoseconds: the clock of the kernel's frame timestamps.
 pub fn monotonic_ns() -> u64 {

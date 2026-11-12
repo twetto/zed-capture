@@ -5,7 +5,10 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::active_exposure::{self, ActiveExposure, ActiveStats};
+use crate::auto_exposure::Setting;
 use crate::sensor::{ExposureMonitor, ExposureReading, ExposureStats, SensorTiming};
+use crate::video::ExposureSource;
 use crate::{FrameClock, Imu, ImuSample, Video, VideoConfig, find};
 
 /// Marks in the fit before frames are given their pulse (1 s at 30 Hz).
@@ -58,8 +61,9 @@ impl Readout {
 pub struct Camera {
     // The IMU's stream is turned off before the video's.
     imu: Option<Imu>,
-    // The exposure's thread is stopped before the video too.
+    // The exposure's threads are stopped before the video too.
     exposure: Option<ExposureMonitor>,
+    active: Option<ActiveExposure>,
     video: Video,
     frame_sync: Result<bool, String>,
     arrival: Mutex<Arrival>,
@@ -143,13 +147,36 @@ impl Camera {
                     Ok(t)
                 }
             });
+        // zed-capture's own auto exposure, from the camera's last setting
+        let active = match (&timing, video.config().active_exposure.clone()) {
+            (Ok(t), Some(config)) => {
+                video.take_exposure_control()?;
+                let line_ns = 1e9 / video.fps() / t.frame_length as f64;
+                let max_lines = (t.frame_length as u32).saturating_sub(32);
+                let start =
+                    active_exposure::current_setting(sensors, max_lines).unwrap_or(Setting {
+                        lines: 200,
+                        gain: [1.0; 2],
+                    });
+                Some(ActiveExposure::start(
+                    sensors.clone(),
+                    config,
+                    line_ns,
+                    max_lines,
+                    start,
+                )?)
+            }
+            _ => None,
+        };
         let exposure = match &timing {
-            Ok(t) if video.config().read_exposure => Some(ExposureMonitor::start(
-                sensors.clone(),
-                Duration::from_secs_f64(1.0 / video.fps()),
-                t.frame_length as u32,
-                [video.config().read_left_exposure, true],
-            )?),
+            Ok(t) if video.config().read_exposure && active.is_none() => {
+                Some(ExposureMonitor::start(
+                    sensors.clone(),
+                    Duration::from_secs_f64(1.0 / video.fps()),
+                    t.frame_length as u32,
+                    [video.config().read_left_exposure, true],
+                )?)
+            }
             _ => None,
         };
         Ok(Camera {
@@ -159,6 +186,7 @@ impl Camera {
             arrival: Mutex::new(Arrival::default()),
             timing,
             exposure,
+            active,
         })
     }
 
@@ -208,22 +236,42 @@ impl Camera {
             if let Some(readout) = self.readout_with(&clock) {
                 // The exposure in force: set before the previous frame's pulse
                 let set_by = time as f64 - clock.period_ns;
-                let (exposure, gain) = match self
+                let middle = time as f64 + readout.middle_row_ns(frame.height);
+                let mut exposure = [None; 2];
+                if let Some(active) = &self.active {
+                    if let Some(a) = active.applied_at(time as f64, clock.period_ns) {
+                        exposure = [Some(a.setting.lines as f64 * readout.line_ns); 2];
+                        frame.gain = a.raw_gain.map(Some);
+                        frame.exposure_source = a.verified.map(|v| match v {
+                            true => ExposureSource::Active,
+                            false => ExposureSource::ActiveUnchecked,
+                        });
+                        active.frame(
+                            &a,
+                            &frame.left,
+                            &frame.right,
+                            frame.width,
+                            time as f64,
+                            clock.period_ns,
+                        );
+                    }
+                } else if let Some(m) = self
                     .video
                     .manual_exposure()
                     .filter(|m| (m.since_ns as f64) < set_by)
                 {
-                    Some(m) => ([Some(m.lines as f64 * readout.line_ns); 2], m.gain),
-                    None => {
-                        let read = self.exposure_at(set_by);
-                        (
-                            read.map(|r| r.map(|(lines, _)| lines as f64 * readout.line_ns)),
-                            read.map(|r| r.map(|(_, gain)| gain)),
-                        )
-                    }
-                };
-                frame.gain = gain;
-                let middle = time as f64 + readout.middle_row_ns(frame.height);
+                    exposure = [Some(m.lines as f64 * readout.line_ns); 2];
+                    frame.gain = m.gain;
+                    frame.exposure_source = [ExposureSource::Manual; 2];
+                } else {
+                    let read = self.exposure_at(set_by);
+                    exposure = read.map(|r| r.map(|(lines, _)| lines as f64 * readout.line_ns));
+                    frame.gain = read.map(|r| r.map(|(_, gain)| gain));
+                    frame.exposure_source = read.map(|r| match r {
+                        Some(_) => ExposureSource::Read,
+                        None => ExposureSource::None,
+                    });
+                }
                 frame.exposure_ns = exposure.map(|e| e.map(|e| e.round() as u32));
                 frame.mid_exposure_ns =
                     exposure.map(|e| e.map(|e| (middle - e / 2.0).round() as u64));
@@ -271,6 +319,11 @@ impl Camera {
     /// The sensors' timing registers, read when the camera opened, or why they could not be.
     pub fn sensor_timing(&self) -> Result<SensorTiming, &str> {
         self.timing.as_ref().copied().map_err(|e| e.as_str())
+    }
+
+    /// zed-capture's own auto exposure's counts, when it runs ([`VideoConfig::active_exposure`]).
+    pub fn active_exposure_stats(&self) -> Option<ActiveStats> {
+        self.active.as_ref().map(|a| a.stats())
     }
 
     /// Both sensors' exposure readings since the last call (up to 4096 kept), oldest first.

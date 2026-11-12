@@ -86,6 +86,7 @@ pub fn frame_timing_schema() -> Schema {
          # eye's image is read (r - (720 - 1) / 2) * line_us later than its middle row.\n\
          uint8 EXPOSURE_NONE=0\nuint8 EXPOSURE_OWN=1\nuint8 EXPOSURE_MANUAL=2\n\
          uint8 EXPOSURE_OTHER_EYE=3\nuint8 EXPOSURE_LAST_KNOWN=4\n\
+         uint8 EXPOSURE_ACTIVE=5\nuint8 EXPOSURE_ACTIVE_UNCHECKED=6\n\
          std_msgs/Header header\nuint32 mcu_frame_count\nuint32 sequence\n\
          builtin_interfaces/Time kernel_stamp\nbuiltin_interfaces/Time[2] mid_exposure\n\
          float32[2] exposure_us\nuint32[2] gain\nuint8[2] exposure_source\n\
@@ -182,6 +183,8 @@ pub enum Source {
     Manual = 2,
     OtherEye = 3,
     LastKnown = 4,
+    Active = 5,
+    ActiveUnchecked = 6,
 }
 
 pub struct FrameTiming {

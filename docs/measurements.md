@@ -215,6 +215,113 @@ The camera powers up with its anti-flicker at 50 Hz (V4L2's power line frequency
 night under the lab's lights the auto exposure held 747 lines (29.93 ms, three 10 ms flicker
 periods) at 50 Hz and 621 lines (24.88 ms, three 8.33 ms periods) at 60 Hz, Taiwan's mains.
 
+## Active exposure (zed-capture's own)
+
+### When a write takes effect
+
+Exposures written to both sensors at times spread over the frame, the camera still (LabOrin,
+HD720 at 30 Hz): a write that ends before pulse k shows in frame k + 1, wherever in frame k − 1 it
+falls; frame k still has the setting before. So frame n's setting is the newest one written before
+pulse n − 1, which the controller looks up for each frame's stamps. It writes each new setting
+1-18 ms after a pulse (both eyes' four registers take ~8 ms, the right's first), so both eyes take
+it on the same frame, then reads it back.
+
+### Mean mode
+
+The mean mode of `v4l2_trigger_camera`'s auto exposure (target 100, 12 % a step at most,
+saturation and floor rules), one exposure for both eyes, each its own gain, past one flicker
+period in whole periods, at most 25 ms.
+
+- Still, lights on: from the camera's own setting to 25.0 ms, left 1.47× and right 2.30×, means
+  105 and 98, in about 1 s; 7 writes, all read back.
+- 200 s of light swings (lens covered 3 times, the room's lights off, twisting in the dark,
+  lights on): 6000 frames, 1 lost (a USB error), no stall. 244 writes; the right read back every
+  time, the left 49 times not (each written again; 36 frames' left setting unconfirmed).
+- Lit, both eyes held 105/105, at different gains (left 1.8×, right 2.6×): the eyes see different
+  parts of the room.
+- Lights off: 25 ms and 15.94× on both, means 10 (left) and 21 (right), the sensor's limit; the
+  camera's own auto exposure stops at the same.
+- After uncovering the lens the image stayed washed out (mean > 180) 0.63 s each time: from 15.94×
+  back down at 12 % a step is ~19 steps. The camera's own auto exposure took 0-0.6 s in another run.
+- A left image going dark for 7 frames at 53 s was the hand reaching the left lens first: the
+  right followed 33-100 ms later.
+
+### The tone curve
+
+The gradient mode predicts the image after a step, so it needs the camera's response to light.
+Measured on a still scene (the lab at night): both eyes through 15 exposures at gain 1 (8 to 623
+lines) and 10 gains at 208 lines (one flicker period: no flicker), 6 frames averaged a step, every
+write read back. From pixel pairs a step apart, the slope h(z) = dz / d ln(exposure × gain) at each
+output level z (the median, binned by level):
+
+| Level z | 10 | 18 | 34 | 50 | 66 | 82 | 98 | 114 | 130 | 154 | 178 | 202 | 218 | 234 | 250 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| h from exposure (left) | 4.8 | 13.4 | 27.9 | 42.0 | 56.4 | 71.5 | 88.5 | 85.4 | 86.2 | 101.9 | 106.4 | 119.1 | 94.1 | | |
+| h from gain (left) | 5.6 | 13.9 | 28.2 | 42.7 | 54.8 | 67.4 | 86.6 | 85.1 | 87.4 | 101.5 | 111.6 | 105.4 | 108.3 | 60.5 | 1.9 |
+
+- Exposure and gain give the same slope: one curve, after the gain.
+- The two eyes' curves agree within 0.05 in log light: it is the ISP's, not the sensors'.
+- About linear above a black level of 5 up to level ~100 (h ≈ 0.85-0.9 z), then compressed
+  (h ≈ 0.6-0.65 z up to ~210), then a soft shoulder into the clip.
+
+`ZED_TONE_SLOPE` is h every 8 levels, averaged over both eyes and both sweeps. Predicting each
+step's image from another's at ratios 1.05-1.6 (flicker-free pairs), mean |predicted − real| per
+pixel:
+
+| | The curve | Power law 0.76 | Linear (`v4l2_trigger_camera`'s) |
+|---|---|---|---|
+| Left | 1.51 | 3.19 | 5.77 |
+| Left, real > 120 | 2.76 | 9.30 | 18.8 |
+| Right | 1.34 | 2.05 | 3.55 |
+| Right, real > 120 | 4.29 | 7.53 | 15.6 |
+
+At ratios 2.5-4.5 all three miss more (the curve 5.8-7.1). The curve was measured at the camera's
+default image controls (gamma, contrast); another ZED 2i's ISP likely has the same, other models or
+settings not. The controller checks it on every recording: each frame after a step predicted from
+the frame stepped before (`zed_record`'s `tone_curve_check`).
+
+### Gradient mode
+
+`v4l2_trigger_camera`'s gradient mode (after Zhang et al., ICRA 2017), each eye apart, its
+predictions through the tone curve, gradients at every 4th pixel each way.
+
+- Still, lights on (20 s): from the camera's setting (24.9 ms, 1.81×; means 107/84) it settled in
+  1 s at 16.7 ms, left 1.36× and right 1.92×, means 73/66, and held; 7 writes, all read back. The
+  dim room needs gain past 25 ms, and the mode sheds gain down to a mean of ~66 (it raises gain only
+  below 60): less gain and a darker image than the mean mode.
+- The controller took 1.9 ms a frame (both eyes; at most 6.7 ms) on LabOrin.
+- `tone_curve_check`: 1.03 levels mean error with the curve, 3.62 linear, 5.90 for no change.
+
+### Mean against gradient: tracking
+
+Scored as a VIO front end would (GFTT corners topped up to 500 at half resolution, pyramidal KLT
+frame to frame, kept if the backward track returns within 0.5 px): the features tracked a frame
+and the share surviving each frame, left eye. The runs are by hand, one each, so a few % is noise.
+
+The 200 s light swings, each mode:
+
+| | Mean | Gradient |
+|---|---|---|
+| Lit, still (settings) | 25 ms, means ~105 | 16.7 ms, less gain, means 67-75 |
+| Lit, still: tracked | 319-327 | 329-338 |
+| Covered and uncovered | 112-215 | 117-230 |
+| Lights off (both 25 ms, ~15.9×) | 122-218 | 93-195 (the room ~16 % darker that run: means 9.1 against 10.8 at the same setting) |
+| Washed out after uncovering | 0.63 s | 0.70-0.73 s |
+| All 200 s: tracked, survival | 255, 65.2 % | 239, 63.1 % |
+
+40 s in the lit room, 20 s of it twisting ±15° about twice a second, with the camera's own auto
+exposure as a third:
+
+| | Mean | Gradient | Camera's own |
+|---|---|---|---|
+| Exposure; image mean | 25 ms; 95-100 | 16.7-20.8 ms; 67-75 | 21-25 ms; 78-90 |
+| Survival while twisting (three 5-s windows) | 96.8, 88.6, 94.0 % | 97.5, 88.8, 88.5 % | 95.5, 87.2, 96.5 % |
+| All 40 s: tracked, survival | 394, 97.2 % | 367, 97.0 % | 382, 97.5 % |
+
+The three track alike: the gradient mode's shorter exposure did not show in the twist. Its
+controller takes 1.9 ms a frame against the mean mode's 0.18 ms. In the twist the gradient mode
+lengthened its exposure (16.7 → 20.8 ms) as motion blurred the image.
+
 ## Cost of reading the exposure
 
 Each read is a request and its answer through the extension unit, about 1.75 ms. Four reads per
@@ -242,5 +349,6 @@ both eyes, read twice, against 13.9 ms for the exposure alone byte by byte.
 
 - Other video modes and frame rates (the 0.31 ms is measured at HD720 at 30 Hz only).
 - Other ZED models.
-- Which frame a new auto exposure takes effect on. The code assumes the frame after the one it
-  was set during; while the exposure changes, a frame's may be a frame off.
+- Which frame the camera's own auto exposure takes effect on (zed-capture's writes: above). The
+  code assumes the frame after the one it was set during; while the exposure changes, a frame's
+  may be a frame off.
