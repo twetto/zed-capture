@@ -138,6 +138,28 @@ So `Frame::mid_exposure_ns` = the pulse + 4.02 ms + 14.48 ms − half the eye's 
 - A 2 ms manual exposure through `Video::set_manual_exposure`: every frame carried 2.003 ms, and
   the middle row at the pulse + 17.50 ms.
 
+### Gain
+
+With the auto exposure off and the camera still, the brightness at raw gain 128 against exposure
+(2 to 32 ms) gives the image's response to known light; at 2 ms, each raw gain's brightness read
+back through it gives the gain's multiplier:
+
+| Raw gain | 160 | 192 | 224 | 255 | 378 | 440 | 511 | 890 | 960 | 1023 | 1914 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Left | 1.23 | 1.48 | 1.66 | 1.84 | 1.97 | 2.92 | 4.00 | 4.21 | 6.08 | 7.56 | 8.29 |
+| Right | 1.18 | 1.40 | 1.64 | 1.81 | 1.98 | 2.93 | 4.06 | 4.35 | 6.12 | 8.04 | 8.15 |
+| 2^band × low byte / 128 | 1.25 | 1.50 | 1.75 | 1.99 | 1.91 | 2.88 | 3.98 | 3.81 | 6.00 | 7.97 | 7.63 |
+
+So the multiplier is about 2^band × (low byte) / 128, the bands ×1, ×2, ×4, ×8 for 0x0xx, 0x1xx,
+0x3xx, 0x7xx: within ~5 % inside each band; each band's first value read 3-14 % high, in noisy
+steps (`gain_multiplier`). Gains under 128 lower the image too (not measured: too dark); the top
+ones (1980, 2047) clipped. The steps' frames vary with the lights' flicker: these exposures are not
+whole periods of it.
+
+At the same exposure and gain the right image was 40-50 % brighter than the left (about 1.6-1.8×
+in light, through the response): the left eye gets about half the light, and the auto exposure
+gives it about twice the right's gain (440 against 192). A dirty lens, or the sensors differ.
+
 ### The auto exposure runs for each eye apart
 
 Seen: the left 779 and the right 747 lines for 4 s after the stream started; 747 and 768 lines at

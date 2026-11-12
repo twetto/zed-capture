@@ -604,7 +604,9 @@ fn run(a: Args) -> Result<(), String> {
     put("clock_start_realtime_ns", start_real.to_string());
     put(
         "gain",
-        "the OV4689's raw gain register (0-255, 378-511, 890-1023, 1914-2047): not a multiplier"
+        "the OV4689's raw gain register (0-255, 378-511, 890-1023, 1914-2047), not a multiplier: \
+         about 2^band x (raw & 0xff) / 128, the bands x1, x2, x4, x8 for 0x0xx, 0x1xx, 0x3xx, 0x7xx \
+         (zed_capture::gain_multiplier)"
             .into(),
     );
     put("imu_axes", "the IMU's own, not the cameras'".into());

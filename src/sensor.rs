@@ -43,6 +43,23 @@ pub const EYES: [&str; 2] = ["left", "right"];
 pub const GAIN_RANGES: [std::ops::RangeInclusive<u16>; 4] =
     [0..=255, 378..=511, 890..=1023, 1914..=2047];
 
+/// The multiplier a raw gain gives, about: 2^band × (its low byte) / 128, the bands ×1, ×2,
+/// ×4 and ×8 for 0x0xx, 0x1xx, 0x3xx and 0x7xx (measured against exposure on a ZED 2i: within
+/// ~5 % inside each band; see `docs/measurements.md`). None outside [`GAIN_RANGES`].
+pub fn gain_multiplier(raw: u16) -> Option<f32> {
+    let band = match raw >> 8 {
+        0 => 0,
+        1 => 1,
+        3 => 2,
+        7 => 3,
+        _ => return None,
+    };
+    GAIN_RANGES
+        .iter()
+        .any(|r| r.contains(&raw))
+        .then(|| (1u32 << band) as f32 * (raw & 0xff) as f32 / 128.0)
+}
+
 /// Each eye's ISP control register (zed-open-capture's ISP_CTRL_LEFT/RIGHT): bit 1 is the
 /// camera's auto exposure and gain for that eye (0x0b on, 0x09 off on a ZED 2i).
 const ISP_CONTROL: [u32; 2] = [0x8018_1033, 0x8018_1833];
@@ -556,6 +573,15 @@ mod tests {
 
     fn lines_at(h: &VecDeque<ExposureReading>, eye: usize, t: u64) -> Option<f32> {
         newest_answer(h, eye, t).map(|(l, _)| l)
+    }
+
+    #[test]
+    fn gain_multipliers() {
+        assert_eq!(gain_multiplier(128), Some(1.0));
+        assert_eq!(gain_multiplier(440), Some(2.875));
+        assert_eq!(gain_multiplier(2047), Some(8.0 * 255.0 / 128.0));
+        assert_eq!(gain_multiplier(300), None);
+        assert_eq!(gain_multiplier(4096), None);
     }
 
     #[test]
