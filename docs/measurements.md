@@ -170,6 +170,27 @@ searched for 1-3 bytes in either byte order, in lines and in 1/16 lines, and for
 ratio matching the exposures'. The only matches were image statistics, which changed between
 dumps while the exposures held. So the left eye's exposure can only come from its unreliable sensor.
 
+### How the auto exposure moves
+
+Lights on, the lens covered by hand three times, the room's lights off, on again (60 Hz mains):
+
+- It changes the exposure and gain every 3 frames (0.1 s), in steps.
+- Into the dark, exposure first: a little gain at 16.6 ms, then the exposure to 24.9 ms (3 × 8.33,
+  the longest whole number of flicker periods in a 33 ms frame) with the gain back at 1×, then the
+  gain up to its top, 15× (raw ~2032): 1.1-2.0 s from light to the top. Back into light: 15× to 1×
+  in 0.5 s, then the exposure down again.
+- In the light the eyes differed in exposure too, not only in gain: the left 24.9 ms at 1.5-1.6×,
+  the right 16.6 ms at 1.0-1.4× (the left gets less light, above).
+- With the lights off the image's mean was 6.5-7 of 255 at 24.9 ms and 15×, with 5-10 trackable
+  corners (600 in the light): too dark to track, and too dark to place the images in time against
+  the gyro (229 of 929 frame pairs gave a rotation; the fit had no minimum).
+- No frame was lost over the 200 s, the six swings included.
+
+Once, the video stopped by itself, 60 s into a recording on a battery while the camera was carried
+into a dark corridor, a second after the gain went to 12×: no USB error, the camera still enumerated,
+its frame sync still on (so not powered off), and it streamed again when opened. The test above did
+not repeat it.
+
 ### Mains frequency
 
 The camera powers up with its anti-flicker at 50 Hz (V4L2's power line frequency control). At
