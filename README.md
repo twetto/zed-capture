@@ -7,7 +7,8 @@ The Stereolabs ZED 2 / 2i / Mini read without the ZED SDK, on Linux, in Rust.
   instead of losing them, and the kernel's frame timestamps count the frames that were lost.
 - **IMU** through hidraw: every sample at 400 Hz, read by a thread of its own. The camera MCU's
   clock counts the samples lost on the way.
-- **`Camera`**: both together, each frame with the IMU samples read up to its timestamp.
+- **`Camera`**: both together, on the IMU's clock: each frame with its sync pulse and the IMU
+  samples up to it.
 
 Why: the ZED SDK keeps only the newest frame and the newest IMU sample. Under load on a Jetson
 Orin Nano it lost 2-4 % of frames and up to 6 % of IMU samples, while V4L2 alone lost none. See
@@ -31,6 +32,22 @@ while let Some((frame, imu)) = camera.next(Duration::from_secs(1))? {
 the IMU's stream on before the video's, or just after it, makes the video return empty buffers
 with the error flag, and then stop.
 
+**Camera and IMU on one clock.** Each image sensor can send its frame-start pulse to the
+camera's MCU, which then marks the IMU sample of each frame and counts the frames. The pulse is
+off when the camera powers up; `Camera` turns it on (one register bit in each sensor, through the
+camera's UVC extension unit, as zed-open-capture's `ll_activate_sync`). A mark is a 400 Hz
+sample, so alone it places its frame within 2.5 ms; a line through the marks (MCU time against
+the MCU's frame count) places each frame's pulse within tens of µs, and the MCU's clock is
+mapped onto the host's, its rate included (LabOrin's ZED 2i: its clock runs 0.57 % fast). From
+about 3 s after opening, `Camera::next` gives each frame its pulse (`Frame::sync_time_ns`) and
+the IMU samples up to it by the MCU's clock (`ImuSample::time_ns`).
+
+On LabOrin (60 s each: idle, six cores spinning, a reader working 30 ms a frame, both), every
+frame got its pulse; each frame's kernel stamp came 1.1-1.7 ms after it, and pulse to pulse was
+33.335 ms (p10-p90 ±20 µs). Where the image is exposed relative to the pulse (exposure and the
+rolling readout) is still to be measured, by turning the camera: rotation from the images
+against the gyro.
+
 **After the ZED SDK, the IMU comes back by itself.** The SDK detaches the kernel's driver from the
 IMU's USB interface and leaves it detached when it closes the camera, so its hidraw node is gone
 until a replug. `find` attaches the driver again (as libusb's `libusb_attach_kernel_driver`),
@@ -49,11 +66,16 @@ It reports frames and IMU samples missing, ring drops (a late reader), the longe
 how long splitting a frame takes.
 
 ```
-zed_grab OUT [--frames 5] [--every 15] [--skip 3]
+zed_grab OUT [--frames 5] [--every 15] [--skip 3] [--left-only] [--imu]
 ```
 
 It saves raw left and right grey as PGM files, named by timestamp, and the camera's serial
-number, which names its factory calibration (`/usr/local/zed/settings/SN<serial>.conf`).
+number, which names its factory calibration (`/usr/local/zed/settings/SN<serial>.conf`). With
+`--imu`, `frames.csv` (each frame's kernel stamp, sync pulse and MCU count) and `imu.csv`
+(every sample).
+
+`zed_count` also checks the frame sync: how steady each frame's arrival after its pulse is,
+pulse to pulse, and the marks against the fitted pulses.
 
 ## Building for a Jetson (JetPack 6)
 

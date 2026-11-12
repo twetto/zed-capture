@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use std::{io, ptr};
 
 use crate::sys::{self, READ, WRITE, ioc};
+use crate::xu;
 
 // ---- The kernel's V4L2 structs (videodev2.h), 64-bit layouts ----
 
@@ -199,6 +200,12 @@ pub struct Frame {
     pub height: usize,
     pub left: Vec<u8>,
     pub right: Vec<u8>,
+    /// The frame's sync pulse on the host's clock, by the camera MCU's clock: the time of the IMU
+    /// samples ([`ImuSample::time_ns`](crate::ImuSample::time_ns)). Set by
+    /// [`Camera::next`](crate::Camera::next) once the frame marks are fitted, else None.
+    pub sync_time_ns: Option<u64>,
+    /// The MCU's count of this frame, with `sync_time_ns`.
+    pub mcu_frame_count: Option<u32>,
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
@@ -492,6 +499,40 @@ impl Video {
     pub fn buffers(&self) -> u32 {
         self.buffers
     }
+
+    /// Has both image sensors send their frame-start pulse to the camera's MCU, which then marks
+    /// the IMU sample of each frame ([`ImuSample::frame_sync`](crate::ImuSample::frame_sync)) and
+    /// counts the frames: each frame's time on the IMU's clock. Off when the camera powers up
+    /// (the ZED SDK turns it on, and it stays on until the camera is unplugged). Returns whether
+    /// it was already on, per eye.
+    pub fn enable_frame_sync(&self) -> io::Result<[bool; 2]> {
+        let fd = self.file.as_raw_fd();
+        let mut was_on = [false; 2];
+        for (eye, on) in was_on.iter_mut().enumerate() {
+            let what = |e: io::Error| {
+                context(
+                    e,
+                    &format!("the {} sensor's sync output", ["left", "right"][eye]),
+                )
+            };
+            let v = xu::read_sensor_register(fd, eye, xu::REG_SYNC_OUTPUT).map_err(what)?;
+            *on = v & xu::SYNC_OUTPUT_ON != 0;
+            if !*on {
+                xu::write_sensor_register(fd, eye, xu::REG_SYNC_OUTPUT, v | xu::SYNC_OUTPUT_ON)
+                    .map_err(what)?;
+                let back = xu::read_sensor_register(fd, eye, xu::REG_SYNC_OUTPUT).map_err(what)?;
+                if back & xu::SYNC_OUTPUT_ON == 0 {
+                    return Err(io::Error::other(format!(
+                        "the {} sensor's sync output: register {:#06x} reads {back:#04x} after writing {:#04x}",
+                        ["left", "right"][eye],
+                        xu::REG_SYNC_OUTPUT,
+                        v | xu::SYNC_OUTPUT_ON
+                    )));
+                }
+            }
+        }
+        Ok(was_on)
+    }
 }
 
 impl Drop for Video {
@@ -582,6 +623,8 @@ impl Capture {
                     height: self.height,
                     left,
                     right,
+                    sync_time_ns: None,
+                    mcu_frame_count: None,
                     pool: self.pool.clone(),
                 })
             } else {

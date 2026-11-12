@@ -6,8 +6,9 @@
 //!   they reached it.
 //! - [`Imu`]: every sample of the camera's IMU through hidraw, in a thread of its own, with the
 //!   camera MCU's clock to count samples lost on the way.
-//! - [`Camera`]: both, started in the order that works (the IMU after the first frame), each
-//!   frame with the IMU samples read up to its timestamp.
+//! - [`Camera`]: both, started in the order that works (the IMU after the first frame), with the
+//!   image sensors' frame pulses on: each frame with its pulse on the IMU's clock and the IMU
+//!   samples up to it ([`clock`]).
 //! - [`find`]: the camera's video and hidraw devices, from sysfs; it gives the IMU back to the
 //!   kernel when the ZED SDK left it detached ([`reattach_hid`]).
 //!
@@ -16,12 +17,15 @@
 //! sample.
 
 pub mod camera;
+pub mod clock;
 pub mod device;
 pub mod imu;
 mod sys;
 pub mod video;
+mod xu;
 
 pub use camera::Camera;
+pub use clock::FrameClock;
 pub use device::{Devices, find, reattach_hid};
 pub use imu::{Imu, ImuSample, ImuStats};
 pub use video::{Frame, Video, VideoConfig, VideoStats};

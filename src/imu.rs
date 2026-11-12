@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::clock::{ClockMap, FrameClock, Mark, MarkFit};
 use crate::monotonic_ns;
 use crate::sys::{self, READ, WRITE, ioc};
 
@@ -34,6 +35,10 @@ const NOMINAL_INTERVAL_NS: u64 = 2_500_000;
 /// Samples kept for the reader: 10 s at 400 Hz.
 const QUEUE_LEN: usize = 4000;
 const PING_EVERY: Duration = Duration::from_secs(1);
+/// The MCU clock's map onto the host's: over this many one-second windows.
+const CLOCK_WINDOWS: usize = 20;
+/// The frame marks in the fit: 10 s at 30 Hz.
+const FIT_MARKS: usize = 300;
 
 fn hidiocsfeature(len: usize) -> libc::c_ulong {
     ioc(READ | WRITE, b'H', 0x06, len)
@@ -46,6 +51,10 @@ pub struct ImuSample {
     pub mcu_time_ns: u64,
     /// `CLOCK_MONOTONIC` when the report was read.
     pub host_time_ns: u64,
+    /// The sample's time on the host's clock (`CLOCK_MONOTONIC` ns), from the MCU's: its MCU
+    /// time mapped onto the host's clock (the least read latency included), as known when it was
+    /// read.
+    pub time_ns: u64,
     /// m/s²
     pub accel: [f32; 3],
     /// rad/s
@@ -78,6 +87,12 @@ pub struct ImuStats {
     pub queue_drops: u64,
     /// Frame marks seen, and the MCU's frame counter's first and last values.
     pub frame_syncs: u64,
+    /// Marks with the previous mark's count, and marks whose count skips.
+    pub mark_repeats: u64,
+    pub mark_skips: u64,
+    /// Marks left out of the frames' fit as off its line, and the fit's restarts.
+    pub marks_off_line: u64,
+    pub mark_fit_restarts: u64,
     pub first_frame_count: Option<u32>,
     pub last_frame_count: u32,
 }
@@ -85,6 +100,7 @@ pub struct ImuStats {
 struct Shared {
     queue: Mutex<VecDeque<ImuSample>>,
     stats: Mutex<ImuStats>,
+    clock: Mutex<Option<FrameClock>>,
     stop: AtomicBool,
     failed: Mutex<Option<String>>,
 }
@@ -113,6 +129,7 @@ impl Imu {
         let shared = Arc::new(Shared {
             queue: Mutex::new(VecDeque::with_capacity(QUEUE_LEN)),
             stats: Mutex::new(ImuStats::default()),
+            clock: Mutex::new(None),
             stop: AtomicBool::new(false),
             failed: Mutex::new(None),
         });
@@ -139,9 +156,19 @@ impl Imu {
     /// The samples read up to `host_time_ns` (`CLOCK_MONOTONIC`, as a frame's timestamp), oldest
     /// first; later ones stay queued.
     pub fn drain_until(&self, host_time_ns: u64) -> io::Result<Vec<ImuSample>> {
+        self.drain_while(|s| s.host_time_ns <= host_time_ns)
+    }
+
+    /// The samples taken up to `time_ns` by the MCU's clock ([`ImuSample::time_ns`]), oldest
+    /// first; later ones stay queued.
+    pub fn drain_until_time(&self, time_ns: u64) -> io::Result<Vec<ImuSample>> {
+        self.drain_while(|s| s.time_ns <= time_ns)
+    }
+
+    fn drain_while(&self, keep: impl Fn(&ImuSample) -> bool) -> io::Result<Vec<ImuSample>> {
         let samples: Vec<ImuSample> = {
             let mut queue = self.shared.queue.lock().unwrap();
-            let n = queue.partition_point(|s| s.host_time_ns <= host_time_ns);
+            let n = queue.iter().take_while(|s| keep(s)).count();
             queue.drain(..n).collect()
         };
         if samples.is_empty()
@@ -150,6 +177,12 @@ impl Imu {
             return Err(io::Error::other(e.clone()));
         }
         Ok(samples)
+    }
+
+    /// The frames' pulses, fitted to the MCU's frame marks so far (see [`FrameClock`]); None
+    /// before the third mark, or when the image sensors' sync output is off.
+    pub fn frame_clock(&self) -> Option<FrameClock> {
+        *self.shared.clock.lock().unwrap()
     }
 
     pub fn stats(&self) -> ImuStats {
@@ -194,6 +227,9 @@ impl Reader {
         let mut last_ping = Instant::now();
         let mut last_mcu: Option<u64> = None;
         let mut last_read: Option<u64> = None;
+        let mut last_mark: Option<u32> = None;
+        let mut map = ClockMap::new(CLOCK_WINDOWS);
+        let mut fit = MarkFit::new(FIT_MARKS);
         while !self.shared.stop.load(Ordering::Relaxed) {
             if last_ping.elapsed() >= PING_EVERY {
                 set_feature(fd, &[REP_ID_REQUEST_SET, RQ_CMD_PING])?;
@@ -219,10 +255,25 @@ impl Reader {
                 s.bad_reports += 1;
                 continue;
             };
-            let Some(sample) = report else {
+            let Some(mut sample) = report else {
                 s.not_valid += 1;
                 continue;
             };
+            map.add(sample.mcu_time_ns, host_time_ns);
+            sample.time_ns = map
+                .to_host(sample.mcu_time_ns as f64)
+                .map_or(host_time_ns, |t| t.max(0.0) as u64);
+            if sample.frame_sync {
+                match fit.add(sample.frame_sync_count, sample.mcu_time_ns) {
+                    Mark::OffLine => s.marks_off_line += 1,
+                    Mark::Restart => s.mark_fit_restarts += 1,
+                    Mark::Fitted | Mark::Repeat => {}
+                }
+                // Once the MCU clock's rate is known
+                *self.shared.clock.lock().unwrap() = (map.closed_windows() >= 2)
+                    .then(|| fit.clock(&map))
+                    .flatten();
+            }
             s.samples += 1;
             if let Some(t) = last_mcu
                 && sample.mcu_time_ns > t
@@ -238,6 +289,14 @@ impl Reader {
             last_mcu = Some(sample.mcu_time_ns);
             if sample.frame_sync {
                 s.frame_syncs += 1;
+                if let Some(c) = last_mark {
+                    match sample.frame_sync_count.wrapping_sub(c) {
+                        0 => s.mark_repeats += 1,
+                        1 => {}
+                        _ => s.mark_skips += 1,
+                    }
+                }
+                last_mark = Some(sample.frame_sync_count);
             }
             s.first_frame_count.get_or_insert(sample.frame_sync_count);
             s.last_frame_count = sample.frame_sync_count;
@@ -274,6 +333,7 @@ fn parse(report: &[u8], host_time_ns: u64) -> Option<Option<ImuSample>> {
     Some(Some(ImuSample {
         mcu_time_ns: mcu_ticks_to_ns(ticks),
         host_time_ns,
+        time_ns: 0,
         gyro: [
             i16_at(10) * GYRO_SCALE,
             i16_at(12) * GYRO_SCALE,

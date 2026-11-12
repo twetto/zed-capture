@@ -131,7 +131,22 @@ fn run() -> Result<(), String> {
         a.skip
     );
 
+    if imu.is_some() {
+        match camera.frame_sync() {
+            Ok(was) => println!(
+                "frame marks: on (the sensors' sync output was {})",
+                if was == [true, true] {
+                    "already on"
+                } else {
+                    "off: turned on"
+                }
+            ),
+            Err(e) => println!("frame marks: not turned on: {e}"),
+        }
+    }
+
     let work = Duration::from_secs_f64(a.work_ms / 1e3);
+    let mut sync = SyncCheck::default();
     let start = Instant::now();
     let mut counting = false;
     let (mut taken, mut imu_taken, mut first_seq, mut last_seq) = (0u64, 0u64, None, 0u32);
@@ -165,6 +180,7 @@ fn run() -> Result<(), String> {
                 .sum::<f64>();
             taken += 1;
             imu_taken += samples.len() as u64;
+            sync.add(&frame, &samples);
             if a.gaps
                 && let Some(prev) = first_seq.map(|_| (last_seq, last_ts))
             {
@@ -229,7 +245,7 @@ fn run() -> Result<(), String> {
             .first_frame_count
             .map(|f| i.last_frame_count.wrapping_sub(f));
         println!(
-            "imu: {} samples ({:.1} Hz), {} taken; missing {} by the MCU clock ({:.2} %); gaps over 5 ms {}, longest {:.1} ms; longest read gap {:.1} ms; not valid {}, bad reports {}, queue drops {}; frame marks {}, MCU frame count +{}",
+            "imu: {} samples ({:.1} Hz), {} taken; missing {} by the MCU clock ({:.2} %); gaps over 5 ms {}, longest {:.1} ms; longest read gap {:.1} ms; not valid {}, bad reports {}, queue drops {}; frame marks {} ({} repeated, {} skipping, {} off the fit's line, {} fit restarts), MCU frame count +{}",
             i.samples,
             i.samples as f64 / secs,
             imu_taken,
@@ -242,8 +258,117 @@ fn run() -> Result<(), String> {
             i.bad_reports,
             i.queue_drops,
             i.frame_syncs,
+            i.mark_repeats,
+            i.mark_skips,
+            i.marks_off_line,
+            i.mark_fit_restarts,
             mcu_frames.map(|n| n.to_string()).unwrap_or("?".into())
         );
     }
+    if let Some(imu) = imu {
+        sync.report(imu.frame_clock(), camera.arrival_periods());
+    }
     Ok(())
+}
+
+fn ms(ns: i64) -> String {
+    format!("{:.3}", ns as f64 / 1e6)
+}
+
+/// Each frame's pulse (by the MCU's clock) against its kernel stamp, and the marks against the
+/// pulses.
+#[derive(Default)]
+struct SyncCheck {
+    frames: u64,
+    synced: u64,
+    /// Kernel stamp − pulse.
+    arrival: Vec<i64>,
+    /// Pulse − the previous frame's pulse, when the frames are consecutive by the kernel.
+    interval: Vec<i64>,
+    /// The MCU's count from one frame to the next, when not 1 (by the kernel's sequence: 1).
+    count_steps_off: u64,
+    /// A mark's time − the pulse of the frame with its count.
+    mark_after_pulse: Vec<i64>,
+    pulses: std::collections::HashMap<u32, u64>,
+    pending_marks: Vec<(u32, u64)>,
+    prev: Option<(u32, u64, u32)>,
+}
+
+impl SyncCheck {
+    fn add(&mut self, frame: &zed_capture::Frame, samples: &[zed_capture::ImuSample]) {
+        self.frames += 1;
+        self.pending_marks.extend(
+            samples
+                .iter()
+                .filter(|x| x.frame_sync)
+                .map(|x| (x.frame_sync_count, x.time_ns)),
+        );
+        let (Some(t), Some(count)) = (frame.sync_time_ns, frame.mcu_frame_count) else {
+            self.prev = None;
+            return;
+        };
+        self.synced += 1;
+        self.arrival.push(frame.timestamp_ns as i64 - t as i64);
+        if let Some((seq, pt, pcount)) = self.prev
+            && frame.sequence.wrapping_sub(seq) == 1
+        {
+            self.interval.push(t as i64 - pt as i64);
+            self.count_steps_off += (count.wrapping_sub(pcount) != 1) as u64;
+        }
+        self.prev = Some((frame.sequence, t, count));
+        self.pulses.insert(count, t);
+        let pulses = &self.pulses;
+        let mut kept = Vec::new();
+        for (c, mt) in self.pending_marks.drain(..) {
+            match pulses.get(&c) {
+                Some(&p) => self.mark_after_pulse.push(mt as i64 - p as i64),
+                None => kept.push((c, mt)),
+            }
+        }
+        self.pending_marks = kept;
+    }
+
+    fn report(&mut self, clock: Option<zed_capture::FrameClock>, arrival: Option<f64>) {
+        let q = |v: &mut Vec<i64>| -> String {
+            if v.is_empty() {
+                return "–".into();
+            }
+            v.sort();
+            let p = |f: f64| v[((v.len() - 1) as f64 * f).round() as usize];
+            format!(
+                "min {} p10 {} median {} p90 {} max {} ms",
+                ms(v[0]),
+                ms(p(0.1)),
+                ms(p(0.5)),
+                ms(p(0.9)),
+                ms(*v.last().unwrap())
+            )
+        };
+        match clock {
+            Some(c) => println!(
+                "sync: {} of {} frames on the IMU's clock; fit of {} marks: period {:.4} ms ({:.4} by the MCU, whose clock runs {:+.0} ppm), marks up to {:.3} ms above the line; arrival learned {}",
+                self.synced,
+                self.frames,
+                c.marks,
+                c.period_ns / 1e6,
+                c.mcu_period_ns / 1e6,
+                (1.0 / c.clock_rate - 1.0) * 1e6,
+                c.spread_ns / 1e6,
+                arrival
+                    .map(|a| format!("{:.2} ms", a * c.period_ns / 1e6))
+                    .unwrap_or("–".into())
+            ),
+            None => println!("sync: no frame marks fitted ({} frames)", self.frames),
+        }
+        println!("  kernel stamp after the pulse: {}", q(&mut self.arrival));
+        println!(
+            "  pulse to pulse, consecutive frames: {}; MCU count steps other than 1: {}",
+            q(&mut self.interval),
+            self.count_steps_off
+        );
+        println!(
+            "  each mark after its frame's pulse (within one IMU interval, 2.5 ms, if matched): {}",
+            q(&mut self.mark_after_pulse)
+        );
+    }
 }
