@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "zed-capture"
+version = "0.1.0"
+description = "Python bindings for zed-capture: a ZED 2 / 2i's stereo video, every IMU sample and each frame's timing on Linux, without the ZED SDK"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "zed_capture._zed_capture"
+python-source = "python"
+strip = true

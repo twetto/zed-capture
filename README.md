@@ -9,8 +9,9 @@ The Stereolabs ZED 2 / 2i / Mini, read without the ZED SDK, on Linux, in Rust.
   clock counts the samples lost on the way.
 - **`Camera`**: both on one hardware clock. Each frame comes with its sync pulse on the IMU's
   clock, the IMU samples up to it, and each eye's exposure and mid-exposure time.
-- **Exposure**: the camera's auto exposure, or a manual exposure and gain; the mains frequency for
-  its anti-flicker.
+- **Exposure**: the camera's auto exposure, zed-capture's own (both eyes one exposure, every
+  frame's setting known), or a manual exposure and gain; the mains frequency for the anti-flicker.
+- **Python**: `zed_capture.Camera` (`crates/zed-capture-python`), frames as numpy arrays.
 
 Why: the ZED SDK keeps only the newest frame and the newest IMU sample. Under load on a Jetson Orin
 Nano it lost 2-4 % of frames and up to 6 % of IMU samples, while V4L2 alone lost none.
@@ -37,6 +38,32 @@ while let Some((frame, imu)) = camera.next(Duration::from_secs(1))? {
 ```
 
 For a manual exposure: `camera.video().set_manual_exposure(Duration::from_millis(5), Some(gain))`.
+
+### From Python
+
+```python
+import zed_capture
+
+# exposure: "camera" (the ZED's own), "active" (zed-capture's), "gradient", or "manual"
+with zed_capture.Camera(exposure="active", mains_hz=60) as cam:  # waits for the frame sync (~3 s)
+    while True:
+        f = cam.next(timeout=1.0)  # without the GIL; None if no frame came
+        if f is None:
+            continue
+        # f.left, f.right: uint8 (720, 1280), unrectified
+        # f.stamp_ns: the left image's mid-exposure (CLOCK_MONOTONIC); + realtime_offset_ns()
+        #             for the system clock
+        # f.mid_exposure_ns, f.exposure_ns, f.gain, f.exposure_source: per eye
+        # f.imu_time_ns, f.gyro, f.accel: the IMU samples since the previous frame
+cam.stats()  # frames, lost, stalls, the auto exposure's counts
+```
+
+After 3 s without a frame `next()` opens the camera again by itself. `cam.calibration_file` is the
+factory calibration the ZED SDK downloaded (`/usr/local/zed/settings/SN<serial>.conf`), for
+rectifying (Rudolf-V's `StereoRectification.from_zed_conf`). Build and install with maturin in
+`crates/zed-capture-python` (`maturin develop`, or `maturin build --release --zig --target
+aarch64-unknown-linux-gnu` for a Jetson); `pytest tests` there (with a ZED attached and
+`ZED_CAPTURE_CAMERA=1`, the tests that take the camera too).
 
 ## What to know
 

@@ -1,1 +1,5 @@
 /target
+# The Python bindings: maturin develop puts the module beside the package
+__pycache__/
+.pytest_cache/
+*.so

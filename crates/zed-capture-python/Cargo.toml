@@ -1,0 +1,21 @@
+[package]
+name = "zed-capture-python"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+publish = false
+
+[lib]
+name = "_zed_capture"
+crate-type = ["cdylib"]
+
+[dependencies]
+zed-capture = { path = "../.." }
+libc = "0.2"
+numpy = "0.25"
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py310"] }
+
+[lints.clippy]
+# The Python constructor takes every setting as a keyword argument.
+too_many_arguments = "allow"

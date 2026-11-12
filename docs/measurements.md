@@ -345,6 +345,19 @@ the second of a USB protocol error (above), not by the recorder. NVJPG's JPEGs h
 each eye's exposure and gain in one request (registers 0x3500-0x3509) took 6.9 ms a frame for
 both eyes, read twice, against 13.9 ms for the exposure alone byte by byte.
 
+## From Python
+
+`zed_capture.Camera(exposure="active", mains_hz=60)` on LabOrin, read one frame at a time with
+25 ms of busy Python work after each (as a node would), 60 s:
+
+- 1800 frames (30.00 a second), none lost, no IMU sample missing (13.4 a frame).
+- An image's age when `next()` returned it, from its stamp (the middle row's mid-exposure):
+  median 25.2 ms, at most 26.7 ms. Most of it is the rest of the readout (the bottom row is read
+  14.5 ms after the middle one) and the USB transfer.
+- `next()` waited 8.0 ms (median): the frame period less the work. The process took 80 % of a core,
+  75 % of it the work: capture and bindings about 5 %.
+- Opening took 2.8 s, most of it waiting for the frame marks.
+
 ## Not measured
 
 - Other video modes and frame rates (the 0.31 ms is measured at HD720 at 30 Hz only).

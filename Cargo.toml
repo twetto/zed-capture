@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/zed-capture-python"]
+
 [package]
 name = "zed-capture"
 version = "0.1.0"
