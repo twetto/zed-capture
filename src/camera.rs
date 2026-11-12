@@ -38,14 +38,9 @@ pub struct Readout {
 const READOUT_BEFORE_BLANKING_ENDS_NS: f64 = 310_000.0;
 
 /// From the pulse to the sensor's first output row being read (ns), by the IMU's clock: the
-/// frame's blanking lines (its lines but the rows output; HD720 at 30 Hz: 108, 4.33 ms) come
-/// first, less 0.31 ms. Turning the camera by hand against the gyro (LabOrin's ZED 2i,
-/// 2026-11-12, HD720 at 30 Hz: 8 runs at exposures of 1.4, 16, 30 and 31 ms) put the image's
-/// middle row at the pulse + 4.02 ms + its readout − 0.502 (±0.005) × the exposure, within
-/// ±0.24 ms; the top row read first, 39.1-40.6 µs a row. Whether the 0.31 ms is the pulse coming
-/// a few lines into the blanking or a delay in the IMU's path, one mode cannot tell: other modes
-/// are not measured. The kernel stamp comes before the first row (1.1-1.7 ms after the pulse):
-/// the camera starts each frame's transfer during the blanking.
+/// frame's blanking lines (its lines but the rows output; HD720 at 30 Hz: 108, 4.33 ms), less
+/// 0.31 ms: 4.02 ms at HD720 at 30 Hz, measured against the gyro (the only mode measured; see
+/// `docs/measurements.md`).
 pub fn pulse_to_readout_ns(frame_length: u16, output_height: u16, line_ns: f64) -> f64 {
     (frame_length as f64 - output_height as f64) * line_ns - READOUT_BEFORE_BLANKING_ENDS_NS
 }
@@ -141,7 +136,9 @@ impl Camera {
                 if !(1..4096).contains(&t.frame_length)
                     || t.output_height < video.config().height as u16
                 {
-                    Err(format!("the sensors' timing does not fit the stream: {t:?}"))
+                    Err(format!(
+                        "the sensors' timing does not fit the stream: {t:?}"
+                    ))
                 } else {
                     Ok(t)
                 }
@@ -177,23 +174,22 @@ impl Camera {
     /// With the frame marks fitted ([`Imu::frame_clock`]; about 1.5 s after opening), the frame
     /// gets its pulse on the IMU's clock ([`crate::Frame::sync_time_ns`]) and the samples up to
     /// it by that clock: camera and IMU on one hardware clock. Each frame is matched to the
-    /// pulse that came a steady time before its kernel stamp (LabOrin's ZED 2i: 1.2-1.5 ms),
+    /// pulse that came a steady time before its kernel stamp (about 1.5 ms on a ZED 2i),
     /// learned over the first frames, followed after, and taken to be under one frame period.
     /// Before that (the first ~3 s: the MCU clock's rate takes two seconds), without marks, and
     /// over a second after the newest mark, the samples read up to the frame's kernel stamp.
     ///
     /// With its pulse, the frame gets each eye's exposure ([`crate::Frame::exposure_ns`]) and the
     /// middle of the exposure of each eye's middle row ([`crate::Frame::mid_exposure_ns`]): the
-    /// pulse, plus the readout to that row ([`Readout`]), less half the eye's exposure. The
-    /// pulse is the left sensor's; the right's rows are read with the left's (one shake run on
-    /// both eyes: each middle row within 0.06 ms of its stamp). An eye's exposure is the manual one
-    /// ([`Video::set_manual_exposure`]) if it was set before the previous frame's pulse, else
-    /// its sensor's newest answer to the readings of its registers (both read once a frame, in a
-    /// thread of its own) from before the previous frame's pulse, and at most 1 s before:
-    /// OmniVision's sensors take a new exposure at a frame's start, for the frame after. While
-    /// the auto exposure changes, it may be a frame off; [`Camera::drain_exposure`] has every
-    /// reading. The left sensor often does not answer for a second or more: its exposure is then
-    /// None (the right's is close, but can be up to ~5 ms apart).
+    /// pulse, plus the readout to that row ([`Readout`]), less half the eye's exposure. The pulse
+    /// is the left sensor's; the right's rows are read with the left's. An eye's exposure is the
+    /// manual one ([`Video::set_manual_exposure`]) if it was set before the previous frame's pulse,
+    /// else its sensor's newest answer to the readings of its registers (both read once a frame, in
+    /// a thread of its own) from before the previous frame's pulse, and at most 1 s before:
+    /// OmniVision's sensors take a new exposure at a frame's start, for the frame after. While the
+    /// auto exposure changes, it may be a frame off; [`Camera::drain_exposure`] has every reading.
+    /// The left sensor often does not answer for a second or more: its exposure is then None (the
+    /// right's is close, but can be up to ~5 ms apart).
     pub fn next(&self, timeout: Duration) -> io::Result<Option<(crate::Frame, Vec<ImuSample>)>> {
         let Some(mut frame) = self.video.next(timeout)? else {
             return Ok(None);
@@ -222,7 +218,8 @@ impl Camera {
                 };
                 let middle = time as f64 + readout.middle_row_ns(frame.height);
                 frame.exposure_ns = exposure.map(|e| e.map(|e| e.round() as u32));
-                frame.mid_exposure_ns = exposure.map(|e| e.map(|e| (middle - e / 2.0).round() as u64));
+                frame.mid_exposure_ns =
+                    exposure.map(|e| e.map(|e| (middle - e / 2.0).round() as u64));
             }
             let samples = imu.drain_until_time(time)?;
             return Ok(Some((frame, samples)));
@@ -271,7 +268,10 @@ impl Camera {
 
     /// Both sensors' exposure readings since the last call (up to 4096 kept), oldest first.
     pub fn drain_exposure(&self) -> Vec<ExposureReading> {
-        self.exposure.as_ref().map(|m| m.drain()).unwrap_or_default()
+        self.exposure
+            .as_ref()
+            .map(|m| m.drain())
+            .unwrap_or_default()
     }
 
     pub fn exposure_stats(&self) -> Option<ExposureStats> {

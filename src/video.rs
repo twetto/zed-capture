@@ -12,8 +12,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::{io, ptr};
 
-use crate::sys::{self, READ, WRITE, ioc};
 use crate::sensor::{EYES, Sensors};
+use crate::sys::{self, READ, WRITE, ioc};
 use crate::xu;
 
 // ---- The kernel's V4L2 structs (videodev2.h), 64-bit layouts ----
@@ -243,8 +243,8 @@ pub struct Frame {
     /// The MCU's count of this frame, with `sync_time_ns`.
     pub mcu_frame_count: Option<u32>,
     /// Each eye's exposure (ns; left, right), with `sync_time_ns`: the camera's auto exposure
-    /// runs for each eye apart (LabOrin: the same to 123 lines, 4.9 ms, apart). None for an eye
-    /// whose sensor has not answered for a second (the left's often does not):
+    /// runs for each eye apart. None for an eye whose sensor has not answered for a second (the
+    /// left's often does not):
     /// [`Camera::next`](crate::Camera::next) says which reading.
     pub exposure_ns: [Option<u32>; 2],
     /// The middle of the exposure of each eye's image's middle row (host ns), with its
@@ -351,7 +351,7 @@ impl Video {
     /// [`Imu`](crate::Imu)'s stream on only after the first frame
     /// ([`Video::wait_for_first_frame`]; [`Camera`](crate::Camera) does): turned on before, or
     /// even just after STREAMON, the video's buffers come back empty with the error flag and
-    /// then stop coming (ZED 2i, LabOrin, 2026-11-08: 2 of 2 before, 1 of 5 just after). The
+    /// then stop coming (a ZED 2i: always before, sometimes just after). The
     /// capture thread stops with an error after 3 s without a good frame.
     pub fn open(path: &Path, config: VideoConfig) -> io::Result<Video> {
         let file = OpenOptions::new()
@@ -575,23 +575,27 @@ impl Video {
         self.buffers
     }
 
-    /// Has image sensor `eye` send its frame-start pulse (VSYNC) out to the camera's MCU. The
-    /// MCU marks the IMU sample of each of the left sensor's pulses
-    /// ([`ImuSample::frame_sync`](crate::ImuSample::frame_sync)) and counts them: each frame's
-    /// time on the IMU's clock (LabOrin's ZED 2i, 2026-11-12: with the left's output off the
-    /// marks stop, with the right's they go on). Off when the camera powers up; the ZED SDK
-    /// turns both on, and they stay on until the camera is unplugged. Returns whether it was
-    /// already on. Each read is checked, and a sensor that does not answer (see
-    /// [`crate::sensor`]) asked again for up to `wait`.
+    /// Has image sensor `eye` send its frame-start pulse (VSYNC) out to the camera's MCU. The MCU
+    /// marks the IMU sample of each of the left sensor's pulses
+    /// ([`ImuSample::frame_sync`](crate::ImuSample::frame_sync)) and counts them: each frame's time
+    /// on the IMU's clock. The right's pulse is not marked. Off when the camera powers up; the ZED
+    /// SDK turns both on, and they stay on until the camera is unplugged. Returns whether it was
+    /// already on. Each read is checked, and a sensor that does not answer (see [`crate::sensor`])
+    /// asked again for up to `wait`.
     pub fn enable_frame_sync(&self, eye: usize, wait: Duration) -> io::Result<bool> {
         let what = |e: io::Error| context(e, &format!("the {} sensor's sync output", EYES[eye]));
         let s = &self.sensors;
-        let v = s.read_checked(eye, xu::REG_SYNC_OUTPUT, wait).map_err(what)?;
+        let v = s
+            .read_checked(eye, xu::REG_SYNC_OUTPUT, wait)
+            .map_err(what)?;
         if v & xu::SYNC_OUTPUT_ON != 0 {
             return Ok(true);
         }
-        s.write(eye, xu::REG_SYNC_OUTPUT, v | xu::SYNC_OUTPUT_ON).map_err(what)?;
-        let back = s.read_checked(eye, xu::REG_SYNC_OUTPUT, wait).map_err(what)?;
+        s.write(eye, xu::REG_SYNC_OUTPUT, v | xu::SYNC_OUTPUT_ON)
+            .map_err(what)?;
+        let back = s
+            .read_checked(eye, xu::REG_SYNC_OUTPUT, wait)
+            .map_err(what)?;
         if back & xu::SYNC_OUTPUT_ON == 0 {
             return Err(io::Error::other(format!(
                 "the {} sensor's sync output: register {:#06x} reads {back:#04x} after writing {:#04x}",
@@ -609,9 +613,8 @@ impl Video {
     }
 
     /// Sets the mains frequency of the lights (50 or 60 Hz, or 0 for none): the camera's auto
-    /// exposure keeps to whole periods of their flicker (twice the mains). LabOrin's ZED 2i at
-    /// night: 747 lines (29.93 ms, 3 × 10 ms) at 50 Hz, 621 (24.88 ms, 3 × 8.33 ms) at 60 Hz.
-    /// The camera powers up at 50 Hz; Taiwan's mains are 60 Hz.
+    /// exposure keeps to whole periods of their flicker (twice the mains). The camera powers up
+    /// at 50 Hz.
     pub fn set_mains_hz(&self, hz: u32) -> io::Result<()> {
         set_mains(self.file.as_raw_fd(), hz)
     }
@@ -633,7 +636,10 @@ impl Video {
 
     /// Whether the camera's auto exposure and gain is on, per eye.
     pub fn auto_exposure(&self) -> io::Result<[bool; 2]> {
-        Ok([self.sensors.auto_exposure(0)?, self.sensors.auto_exposure(1)?])
+        Ok([
+            self.sensors.auto_exposure(0)?,
+            self.sensors.auto_exposure(1)?,
+        ])
     }
 
     /// Turns the camera's auto exposure and gain back on, both eyes.

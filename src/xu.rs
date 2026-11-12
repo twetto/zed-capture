@@ -120,9 +120,7 @@ fn sensor_request(task: u8, eye: usize, register: u16) -> [u8; REQUEST_LEN] {
 }
 
 /// One byte of an image sensor's register (`eye` 0 left, 1 right), with requests of `len`
-/// ([`request_len`]). 0xff when the sensor does not answer: when it is not streaming, and for
-/// spans of ~0.6 s every few seconds on the left sensor of LabOrin's ZED 2i while it streams
-/// (2026-11-12; the right's always answered).
+/// ([`request_len`]). 0xff or 0x00 when the sensor does not answer (see [`crate::sensor`]).
 pub fn read_sensor_register(fd: RawFd, len: usize, eye: usize, register: u16) -> io::Result<u8> {
     let mut b = sensor_request(TASK_GET, eye, register);
     request(fd, len, &mut b, true)?;

@@ -20,9 +20,9 @@ pub mod camera;
 pub mod clock;
 pub mod device;
 pub mod imu;
+pub mod sensor;
 mod sys;
 pub mod video;
-pub mod sensor;
 mod xu;
 
 pub use camera::Camera;

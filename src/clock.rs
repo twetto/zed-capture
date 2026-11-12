@@ -13,8 +13,8 @@ use std::collections::VecDeque;
 /// The MCU's clock onto the host's: a line along the lower edge of (read time − MCU time)
 /// against MCU time, since the read latency only adds. One point per one-second window, its
 /// least-latency read, over the last `max_windows` windows; the slope by least squares, placed
-/// under all the points. The MCU's clock does not keep the host's rate (LabOrin's ZED 2i: 0.4 %
-/// fast, its ticks taken as 39.0625 µs), so an offset alone would drift.
+/// under all the points. The MCU's clock does not keep the host's rate (a ZED 2i's ran about
+/// 0.5 % fast), so an offset alone would drift.
 #[derive(Debug)]
 pub(crate) struct ClockMap {
     /// (MCU ns, read − MCU ns) of each window's least.

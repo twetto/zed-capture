@@ -3,16 +3,14 @@
 //! OmniVision's (the ZED 2i's sensors are OV4689s: chip id 0x4688).
 //!
 //! A sensor that does not answer reads 0xff, or 0x00, in every register, and the camera's
-//! answer says nothing else: when the video is not streaming, and, on LabOrin's ZED 2i
-//! (2026-11-12), the left one while it streams, for spans of 0.6 s (0xff) to 10 s (0x00) and
-//! single reads, a quarter of the time or more (always 0xff with the IMU off). The right one
-//! always answered. So each value is read twice and checked: the chip id first, for the reads
-//! made once; within its range, for the exposure.
+//! answer says nothing else: when the video is not streaming, and often the left one while it
+//! streams, for single reads or seconds on end (the right one always answered; see
+//! `docs/measurements.md`). So each value is read twice and checked: the chip id first, for the
+//! reads made once; within its range, for the exposure.
 //!
 //! One process at a time: a read is a request (SET_CUR) and its answer (GET_CUR), and another
-//! process's request between them takes the answer (2026-11-12: a script reading 0x3002 beside
-//! the exposure's thread got the exposure's 0x30, and wrote it back with bit 7 as 0xb0).
-//! [`Sensors`] keeps a process's requests in turn.
+//! process's request between them takes the answer. [`Sensors`] keeps a process's requests in
+//! turn.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -27,8 +25,7 @@ use crate::{monotonic_ns, xu};
 
 const REG_CHIP_ID: u16 = 0x300a;
 /// Exposure in 1/16 lines, over three registers: bits 19:16 in the first's low nibble, then
-/// 15:8, 7:0. (In whole lines, the 11952 read on LabOrin would be 14 frames long, at 30 Hz.)
-/// Under 4096 lines a frame, as every ZED mode, the first is 0 and not read.
+/// 15:8, 7:0. Under 4096 lines a frame, as every ZED mode, the first is 0 and not read.
 const REG_EXPOSURE: u16 = 0x3500;
 const REG_X_OUTPUT_SIZE: u16 = 0x3808;
 const REG_Y_OUTPUT_SIZE: u16 = 0x380a;
@@ -47,7 +44,7 @@ pub const GAIN_RANGES: [std::ops::RangeInclusive<u16>; 4] =
     [0..=255, 378..=511, 890..=1023, 1914..=2047];
 
 /// Each eye's ISP control register (zed-open-capture's ISP_CTRL_LEFT/RIGHT): bit 1 is the
-/// camera's auto exposure and gain for that eye (0x0b on, 0x09 off on LabOrin's ZED 2i).
+/// camera's auto exposure and gain for that eye (0x0b on, 0x09 off on a ZED 2i).
 const ISP_CONTROL: [u32; 2] = [0x8018_1033, 0x8018_1833];
 const ISP_AUTO_EXPOSURE: u8 = 0x02;
 
@@ -107,7 +104,10 @@ impl Device {
 
     /// Whether the sensor answers: its chip id has neither byte of a sensor that does not.
     fn answering(&mut self, eye: usize) -> io::Result<bool> {
-        let id = [self.read(eye, REG_CHIP_ID)?, self.read(eye, REG_CHIP_ID + 1)?];
+        let id = [
+            self.read(eye, REG_CHIP_ID)?,
+            self.read(eye, REG_CHIP_ID + 1)?,
+        ];
         Ok(!id.iter().any(|b| NO_ANSWER.contains(b)))
     }
 
@@ -310,7 +310,10 @@ impl Sensors {
     pub fn timing(&self, eye: usize, wait: Duration) -> io::Result<SensorTiming> {
         let t = self.device.lock().unwrap().checked(eye, wait, |d| {
             let mut r16 = |register| -> io::Result<u16> {
-                Ok(u16::from_be_bytes([d.read(eye, register)?, d.read(eye, register + 1)?]))
+                Ok(u16::from_be_bytes([
+                    d.read(eye, register)?,
+                    d.read(eye, register + 1)?,
+                ]))
             };
             Ok(SensorTiming {
                 chip_id: r16(REG_CHIP_ID)?,
@@ -417,9 +420,9 @@ impl ExposureMonitor {
                 let mut next = Instant::now();
                 while !st.load(Ordering::Relaxed) {
                     let t0 = monotonic_ns();
-                    let read = sensors.exposure_16ths(0, max_lines).and_then(|l| {
-                        Ok([l, sensors.exposure_16ths(1, max_lines)?])
-                    });
+                    let read = sensors
+                        .exposure_16ths(0, max_lines)
+                        .and_then(|l| Ok([l, sensors.exposure_16ths(1, max_lines)?]));
                     let read_ns = monotonic_ns() - t0;
                     let mut m = s.lock().unwrap();
                     match read {
@@ -538,7 +541,7 @@ mod tests {
         assert_eq!(at(100), [Some(500.0), Some(619.0)]);
         assert_eq!(at(0), [Some(498.0), Some(621.0)]);
         // Nothing before the first reading, nothing over a second old
-        assert_eq!(newest_answer(&h, 0, 0) , Some(498.0));
+        assert_eq!(newest_answer(&h, 0, 0), Some(498.0));
         let late: VecDeque<_> = [r(1, Some(1.0), Some(2.0)), r(5, None, Some(3.0))].into();
         assert_eq!(newest_answer(&late, 0, 1_002_000_000), None);
         assert_eq!(newest_answer(&late, 1, 1_002_000_000), Some(3.0));

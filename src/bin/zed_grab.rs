@@ -222,7 +222,9 @@ fn run(a: Args) -> io::Result<()> {
                 m[1]
             )?;
             for r in camera.drain_exposure() {
-                let lines = r.lines.map(|l| l.map(|l| format!("{l:.4}")).unwrap_or_default());
+                let lines = r
+                    .lines
+                    .map(|l| l.map(|l| format!("{l:.4}")).unwrap_or_default());
                 writeln!(
                     exposure,
                     "{},{},{},{}",
