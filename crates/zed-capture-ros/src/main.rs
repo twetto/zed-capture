@@ -1,24 +1,37 @@
 //! The ZED's frames and IMU as ROS 2 topics, from zed-capture (no ZED SDK), through r2r.
 //!
-//!   zed_ros [--exposure active|gradient|camera] [--mains 50|60] [--eyes both|left|right]
+//!   zed_ros [--images rect|raw|both] [--exposure active|gradient|camera] [--mains 50|60]
+//!           [--eyes both|left|right] [--rect FX,CX,CY] [--calibration SN.conf]
 //!           [--best-effort] [--depth N] [--no-imu] [--prefix /zed] [--seconds S]
 //!
-//! Topics, under --prefix (default /zed):
-//!   left/image_raw, right/image_raw   sensor_msgs/Image, mono8, unrectified
-//!   imu                               sensor_msgs/Imu: every sample, the IMU's own axes, no
-//!                                     orientation
+//! Topics, under --prefix (default /zed), for each eye published:
+//!   <eye>/image_rect     sensor_msgs/Image, mono8, rectified (--images rect, the default, or both)
+//!   <eye>/camera_info    sensor_msgs/CameraInfo of the rectified images: no distortion, K the
+//!                        rectified camera, the right's P with the baseline (Tx = -fx B), as the
+//!                        ZED wrapper publishes for its rectified images
+//!   <eye>/image_raw      sensor_msgs/Image, mono8, unrectified (--images raw or both)
+//!   imu                  sensor_msgs/Imu: every sample, the IMU's own axes, no orientation
 //!
-//! Both eyes' images carry the frame's stamp, so that an exact time synchroniser pairs them: the
+//! Rectification is Rudolf-V's, from the camera's factory calibration (the ZED SDK downloads it to
+//! /usr/local/zed/settings/SN<serial>.conf; --calibration to name another), onto a pinhole camera
+//! with fx = fy: by default the left raw camera's fx, cx and cy, --rect to choose.
+//!
+//! Both eyes' messages carry the frame's stamp, so that an exact time synchroniser pairs them: the
 //! middle of the left image's middle row's exposure (with the camera's own auto exposure the
 //! left's exposure is not read: the right's, close to it). Stamps are on the system clock: each
 //! frame's and sample's `CLOCK_MONOTONIC` time plus the clocks' offset when it is published.
 //! Images are published reliable, keep-last --depth (1), as the ZED wrapper's; --best-effort.
-//! Every 10 s it logs the frames captured and published and what publishing took. After 3 s
-//! without a frame it opens the camera again. Stops on SIGINT or SIGTERM, or after --seconds.
+//! Every 10 s it logs the frames captured and published and what rectifying and publishing took.
+//! After 3 s without a frame it opens the camera again. Stops on SIGINT or SIGTERM, or after
+//! --seconds.
 //!
 //! For images over Fast DDS's shared memory, run it with a segment larger than the default
-//! 512 KB (FASTRTPS_DEFAULT_PROFILES_FILE; mr-neuro-nav's scripts/idog/fastdds_shm16.xml).
+//! 512 KB (FASTRTPS_DEFAULT_PROFILES_FILE; mr-neuro-nav's scripts/idog/fastdds_shm16.xml): with it
+//! subscribers got every frame, without it they lost 0.4-2.6 %.
 
+mod rectify;
+
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -26,8 +39,9 @@ use std::time::{Duration, Instant};
 use r2r::QosProfile;
 use r2r::builtin_interfaces::msg::Time;
 use r2r::geometry_msgs::msg::Vector3;
-use r2r::sensor_msgs::msg::{Image, Imu};
+use r2r::sensor_msgs::msg::{CameraInfo, Image, Imu};
 use r2r::std_msgs::msg::Header;
+use rectify::Rectifier;
 use zed_capture::{AutoExposureConfig, Camera, GradientConfig, ImuSample, VideoConfig};
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -36,7 +50,7 @@ extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
-const USAGE: &str = "usage: zed_ros [--exposure active|gradient|camera] [--mains 50|60] [--eyes both|left|right] [--best-effort] [--depth N] [--no-imu] [--prefix /zed] [--seconds S]";
+const USAGE: &str = "usage: zed_ros [--images rect|raw|both] [--exposure active|gradient|camera] [--mains 50|60] [--eyes both|left|right] [--rect FX,CX,CY] [--calibration SN.conf] [--best-effort] [--depth N] [--no-imu] [--prefix /zed] [--seconds S]";
 
 /// After this long without a frame the camera is opened again.
 const STALL: Duration = Duration::from_secs(3);
@@ -44,11 +58,16 @@ const STALL: Duration = Duration::from_secs(3);
 const SYNC_WAIT: Duration = Duration::from_secs(15);
 /// How often it logs.
 const LOG_EVERY: Duration = Duration::from_secs(10);
+const EYES: [&str; 2] = ["left", "right"];
 
 struct Args {
+    rect: bool,
+    raw: bool,
     exposure: String,
     mains_hz: Option<u32>,
     eyes: [bool; 2],
+    camera: Option<[f64; 3]>,
+    calibration: Option<PathBuf>,
     best_effort: bool,
     depth: usize,
     imu: bool,
@@ -58,9 +77,13 @@ struct Args {
 
 fn args() -> Result<Args, String> {
     let mut a = Args {
+        rect: true,
+        raw: false,
         exposure: "active".into(),
         mains_hz: None,
         eyes: [true, true],
+        camera: None,
+        calibration: None,
         best_effort: false,
         depth: 1,
         imu: true,
@@ -84,6 +107,14 @@ fn args() -> Result<Args, String> {
         let value = it.next().ok_or(format!("{arg} needs a value"))?;
         let bad = || format!("{arg}: bad value {value}");
         match arg.as_str() {
+            "--images" => {
+                (a.rect, a.raw) = match value.as_str() {
+                    "rect" => (true, false),
+                    "raw" => (false, true),
+                    "both" => (true, true),
+                    _ => return Err(bad()),
+                }
+            }
             "--exposure" if ["active", "gradient", "camera"].contains(&value.as_str()) => {
                 a.exposure = value
             }
@@ -96,6 +127,20 @@ fn args() -> Result<Args, String> {
                     _ => return Err(bad()),
                 }
             }
+            "--rect" => {
+                let v: Vec<f64> = value
+                    .split(',')
+                    .map(|x| x.trim().parse().map_err(|_| bad()))
+                    .collect::<Result<_, _>>()?;
+                let [fx, cx, cy] = v[..] else {
+                    return Err(bad());
+                };
+                if fx <= 0.0 {
+                    return Err(bad());
+                }
+                a.camera = Some([fx, cx, cy]);
+            }
+            "--calibration" => a.calibration = Some(value.into()),
             "--depth" => a.depth = value.parse().ok().filter(|&d| d > 0).ok_or_else(bad)?,
             "--prefix" => a.prefix = value.trim_end_matches('/').to_string(),
             "--seconds" => a.seconds = Some(value.parse().map_err(|_| bad())?),
@@ -125,10 +170,12 @@ fn time(ns: i64) -> Time {
     }
 }
 
-/// Opens the ZED and waits for its frames to carry their pulse (the frame marks fitted, ~3 s);
-/// the counts start from there.
-fn open(config: &VideoConfig) -> Result<Camera, String> {
-    let camera = Camera::find(config.clone()).map_err(|e| format!("opening the ZED: {e}"))?;
+/// Opens the ZED (with its serial number) and waits for its frames to carry their pulse (the
+/// frame marks fitted, ~3 s); the counts start from there.
+fn open(config: &VideoConfig) -> Result<(Camera, Option<String>), String> {
+    let d = zed_capture::find().map_err(|e| format!("finding the ZED: {e}"))?;
+    let camera = Camera::open(&d.video, Some(&d.hid), config.clone())
+        .map_err(|e| format!("opening the ZED: {e}"))?;
     let start = Instant::now();
     loop {
         if STOP.load(Ordering::Relaxed) {
@@ -147,7 +194,7 @@ fn open(config: &VideoConfig) -> Result<Camera, String> {
     if let Some(imu) = camera.imu() {
         imu.reset_stats();
     }
-    Ok(camera)
+    Ok((camera, d.serial))
 }
 
 /// Counts over a log period, and in all.
@@ -157,6 +204,8 @@ struct Counts {
     images: u64,
     publish_ns: u64,
     publish_max_ns: u64,
+    rectify_ns: u64,
+    rectify_max_ns: u64,
     imu: u64,
     errors: u64,
 }
@@ -167,15 +216,32 @@ impl Counts {
         self.images += o.images;
         self.publish_ns += o.publish_ns;
         self.publish_max_ns = self.publish_max_ns.max(o.publish_max_ns);
+        self.rectify_ns += o.rectify_ns;
+        self.rectify_max_ns = self.rectify_max_ns.max(o.rectify_max_ns);
         self.imu += o.imu;
         self.errors += o.errors;
     }
 
-    fn publish_ms(&self) -> (f64, f64) {
-        (
+    /// Publishes an image, counting it and its time.
+    fn publish(&mut self, publisher: &r2r::Publisher<Image>, msg: &Image) {
+        let t0 = Instant::now();
+        match publisher.publish(msg) {
+            Ok(()) => self.images += 1,
+            Err(_) => self.errors += 1,
+        }
+        let ns = t0.elapsed().as_nanos() as u64;
+        self.publish_ns += ns;
+        self.publish_max_ns = self.publish_max_ns.max(ns);
+    }
+
+    /// Publishing an image, and rectifying a frame: mean and longest (ms).
+    fn ms(&self) -> [f64; 4] {
+        [
             self.publish_ns as f64 / self.images.max(1) as f64 / 1e6,
             self.publish_max_ns as f64 / 1e6,
-        )
+            self.rectify_ns as f64 / self.frames.max(1) as f64 / 1e6,
+            self.rectify_max_ns as f64 / 1e6,
+        ]
     }
 }
 
@@ -201,6 +267,42 @@ fn imu_message(s: &ImuSample, offset: i64) -> Imu {
     }
 }
 
+/// The rectified camera's info for eye `eye` (0 left, 1 right).
+fn camera_info(r: &Rectifier, eye: usize, header: Header) -> CameraInfo {
+    let (fx, cx, cy) = (r.fx, r.cx, r.cy);
+    let tx = if eye == 1 { -fx * r.baseline } else { 0.0 };
+    CameraInfo {
+        header,
+        height: r.height as u32,
+        width: r.width as u32,
+        distortion_model: "plumb_bob".into(),
+        d: vec![0.0; 5],
+        k: vec![fx, 0.0, cx, 0.0, fx, cy, 0.0, 0.0, 1.0],
+        r: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        p: vec![fx, 0.0, cx, tx, 0.0, fx, cy, 0.0, 0.0, 0.0, 1.0, 0.0],
+        ..Default::default()
+    }
+}
+
+/// One eye's publishers.
+struct EyePubs {
+    rect: Option<r2r::Publisher<Image>>,
+    info: Option<r2r::Publisher<CameraInfo>>,
+    raw: Option<r2r::Publisher<Image>>,
+}
+
+fn image(header: Header, width: usize, height: usize, data: Vec<u8>) -> Image {
+    Image {
+        header,
+        height: height as u32,
+        width: width as u32,
+        encoding: "mono8".into(),
+        is_bigendian: 0,
+        step: width as u32,
+        data,
+    }
+}
+
 fn run(a: Args) -> Result<(), String> {
     let config = VideoConfig {
         mains_hz: a.mains_hz,
@@ -211,6 +313,37 @@ fn run(a: Args) -> Result<(), String> {
         }),
         ..Default::default()
     };
+    eprintln!("zed_ros: opening the ZED ({} exposure)", a.exposure);
+    let (cam, serial) = open(&config)?;
+    let mut camera = Some(cam);
+    let rectifier = match a.rect {
+        true => {
+            let path = a
+                .calibration
+                .clone()
+                .or_else(|| {
+                    serial
+                        .as_ref()
+                        .map(|s| format!("/usr/local/zed/settings/SN{s}.conf").into())
+                })
+                .ok_or(
+                    "the camera's serial number is unknown: name its calibration (--calibration)",
+                )?;
+            let (w, h) = (config.eye_width as usize, config.height as usize);
+            let r = Rectifier::from_zed_conf(&path, w, h, a.camera)?;
+            eprintln!(
+                "zed_ros: rectifying by {} onto fx {:.3}, cx {:.3}, cy {:.3}, baseline {:.5} m",
+                path.display(),
+                r.fx,
+                r.cx,
+                r.cy,
+                r.baseline
+            );
+            Some(r)
+        }
+        false => None,
+    };
+
     let ros = |e: r2r::Error| format!("ROS: {e}");
     let ctx = r2r::Context::create().map_err(ros)?;
     let mut node = r2r::Node::create(ctx, "zed_ros", "").map_err(ros)?;
@@ -220,18 +353,32 @@ fn run(a: Args) -> Result<(), String> {
     } else {
         qos.reliable()
     };
-    const EYES: [&str; 2] = ["left", "right"];
-    let mut image_pubs = Vec::new();
+    let mut pubs = Vec::new();
     for (eye, name) in EYES.iter().enumerate() {
-        image_pubs.push(match a.eyes[eye] {
-            true => Some(
-                node.create_publisher::<Image>(
-                    &format!("{}/{name}/image_raw", a.prefix),
-                    qos.clone(),
-                )
-                .map_err(ros)?,
-            ),
-            false => None,
+        let topic = |t: &str| format!("{}/{name}/{t}", a.prefix);
+        let on = a.eyes[eye];
+        pubs.push(EyePubs {
+            rect: match on && a.rect {
+                true => Some(
+                    node.create_publisher::<Image>(&topic("image_rect"), qos.clone())
+                        .map_err(ros)?,
+                ),
+                false => None,
+            },
+            info: match on && a.rect {
+                true => Some(
+                    node.create_publisher::<CameraInfo>(&topic("camera_info"), qos.clone())
+                        .map_err(ros)?,
+                ),
+                false => None,
+            },
+            raw: match on && a.raw {
+                true => Some(
+                    node.create_publisher::<Image>(&topic("image_raw"), qos.clone())
+                        .map_err(ros)?,
+                ),
+                false => None,
+            },
         });
     }
     let imu_pub = match a.imu {
@@ -244,16 +391,20 @@ fn run(a: Args) -> Result<(), String> {
         ),
         false => None,
     };
-
-    eprintln!("zed_ros: opening the ZED ({} exposure)", a.exposure);
-    let mut camera = Some(open(&config)?);
-    let published: Vec<&str> = (0..2).filter(|&e| a.eyes[e]).map(|e| EYES[e]).collect();
+    let eyes: Vec<&str> = (0..2).filter(|&e| a.eyes[e]).map(|e| EYES[e]).collect();
+    let kinds: Vec<&str> = [(a.rect, "image_rect,camera_info"), (a.raw, "image_raw")]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, k)| *k)
+        .collect();
     eprintln!(
-        "zed_ros: publishing {}/{{{}}}/image_raw{}",
+        "zed_ros: publishing {}/{{{}}}/{{{}}}{}",
         a.prefix,
-        published.join(","),
+        eyes.join(","),
+        kinds.join(","),
         if a.imu { " and imu" } else { "" }
     );
+
     let started = Instant::now();
     let (mut period, mut total) = (Counts::default(), Counts::default());
     let mut last_log = Instant::now();
@@ -266,7 +417,7 @@ fn run(a: Args) -> Result<(), String> {
         // After a stall, the camera again
         let Some(cam) = camera.as_ref() else {
             match open(&config) {
-                Ok(c) => {
+                Ok((c, _)) => {
                     eprintln!("zed_ros: the camera is back");
                     camera = Some(c);
                     last_frame = Instant::now();
@@ -300,41 +451,46 @@ fn run(a: Args) -> Result<(), String> {
             continue;
         };
         last_frame = Instant::now();
+        period.frames += 1;
         let offset = realtime_offset_ns();
         let stamp_ns = frame.mid_exposure_ns[0]
             .or(frame.mid_exposure_ns[1])
             .unwrap_or(frame.timestamp_ns);
-        let stamp = time(stamp_ns as i64 + offset);
-        period.frames += 1;
-        let (w, h) = (frame.width as u32, frame.height as u32);
-        let images = [
+        let header = |eye: usize| Header {
+            stamp: time(stamp_ns as i64 + offset),
+            frame_id: format!("zed_{}_camera_optical_frame", EYES[eye]),
+        };
+        let (w, h) = (frame.width, frame.height);
+        let rectified = rectifier.as_ref().map(|r| {
+            let t0 = Instant::now();
+            let pair = r.rectify_pair([&frame.left, &frame.right]);
+            let ns = t0.elapsed().as_nanos() as u64;
+            period.rectify_ns += ns;
+            period.rectify_max_ns = period.rectify_max_ns.max(ns);
+            pair
+        });
+        let mut raw = [
             std::mem::take(&mut frame.left),
             std::mem::take(&mut frame.right),
         ];
-        for ((publisher, data), name) in image_pubs.iter().zip(images).zip(EYES) {
-            let Some(publisher) = publisher else {
-                continue;
-            };
-            let msg = Image {
-                header: Header {
-                    stamp: stamp.clone(),
-                    frame_id: format!("zed_{name}_camera"),
-                },
-                height: h,
-                width: w,
-                encoding: "mono8".into(),
-                is_bigendian: 0,
-                step: w,
-                data,
-            };
-            let t0 = Instant::now();
-            match publisher.publish(&msg) {
-                Ok(()) => period.images += 1,
-                Err(_) => period.errors += 1,
+        let mut rectified = rectified.map(|[l, r]| [Some(l), Some(r)]);
+        for (eye, p) in pubs.iter().enumerate() {
+            if let (Some(publisher), Some(data)) =
+                (&p.rect, rectified.as_mut().and_then(|r| r[eye].take()))
+            {
+                period.publish(publisher, &image(header(eye), w, h, data));
             }
-            let ns = t0.elapsed().as_nanos() as u64;
-            period.publish_ns += ns;
-            period.publish_max_ns = period.publish_max_ns.max(ns);
+            if let (Some(publisher), Some(r)) = (&p.info, &rectifier)
+                && publisher
+                    .publish(&camera_info(r, eye, header(eye)))
+                    .is_err()
+            {
+                period.errors += 1;
+            }
+            if let Some(publisher) = &p.raw {
+                let data = std::mem::take(&mut raw[eye]);
+                period.publish(publisher, &image(header(eye), w, h, data));
+            }
         }
         if let Some(p) = &imu_pub {
             for s in &samples {
@@ -346,21 +502,22 @@ fn run(a: Args) -> Result<(), String> {
         }
         if last_log.elapsed() >= LOG_EVERY {
             let v = cam.video().stats();
-            let subs: Vec<String> = image_pubs
+            let subs: Vec<String> = pubs
                 .iter()
-                .flatten()
+                .flat_map(|p| p.rect.iter().chain(p.raw.iter()))
                 .map(|p| {
                     p.get_inter_process_subscription_count()
                         .map(|n| n.to_string())
                         .unwrap_or("?".into())
                 })
                 .collect();
-            let (mean, max) = period.publish_ms();
+            let [publish, publish_max, rect, rect_max] = period.ms();
             eprintln!(
-                "zed_ros: {:.0} s: {} frames ({:.2}/s), {} images published in {mean:.2} ms \
-                 each (at most {max:.2}), {} IMU samples, {} errors; lost {} by the camera \
-                 ({} bad buffers, {} sequence numbers skipped, longest {:.1} ms between \
-                 frames), {} from the ring; subscribers {}",
+                "zed_ros: {:.0} s: {} frames ({:.2}/s), rectified in {rect:.2} ms (at most \
+                 {rect_max:.2}), {} images published in {publish:.2} ms each (at most \
+                 {publish_max:.2}), {} IMU samples, {} errors; lost {} by the camera ({} bad \
+                 buffers, {} sequence numbers skipped, longest {:.1} ms between frames), {} from \
+                 the ring; image subscribers {}",
                 started.elapsed().as_secs_f64(),
                 period.frames,
                 period.frames as f64 / last_log.elapsed().as_secs_f64(),
@@ -385,11 +542,12 @@ fn run(a: Args) -> Result<(), String> {
         lost += v.missing_by_time;
         ring_drops += v.ring_drops;
     }
-    let (mean, max) = total.publish_ms();
+    let [publish, publish_max, rect, rect_max] = total.ms();
     eprintln!(
-        "zed_ros: done after {:.1} s: {} frames, {} images published ({mean:.2} ms each, at \
-         most {max:.2}), {} IMU samples, {} errors; lost {lost} by the camera, {ring_drops} \
-         from the ring; {stalls} stalls",
+        "zed_ros: done after {:.1} s: {} frames (rectified in {rect:.2} ms, at most \
+         {rect_max:.2}), {} images published ({publish:.2} ms each, at most {publish_max:.2}), \
+         {} IMU samples, {} errors; lost {lost} by the camera, {ring_drops} from the ring; \
+         {stalls} stalls",
         started.elapsed().as_secs_f64(),
         total.frames,
         total.images,

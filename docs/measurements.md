@@ -376,6 +376,25 @@ With the 16 MB segment (mr-neuro-nav's `fastdds_shm16.xml`) the subscribers got 
 camera gave. Publishing took 0.6-0.9 ms an image; images reached the subscribers 28-31 ms after
 their mid-exposure.
 
+Rectified (`--images rect`, Rudolf-V's maps applied byte to byte): the same as rudolf_v's own
+rectification of the raw pair, every pixel (0 of 921600 differ, both eyes). 6.8 ms a frame with a
+thread an eye, 3.8 ms with two; 8-9 ms on two pinned CPUs beside the node.
+
+The pipeline node (mr-neuro-nav) in shadow on LabOrin (60 s, Light ESS on both eyes, zed_ros or
+the ZED wrapper on CPUs 0-1, the node on 2-5, a stand-in dog stream; the same view):
+
+| | zed_ros | ZED wrapper (depth off) |
+|---|---|---|
+| Node | 29.9 Hz | 29.8 Hz |
+| Image age at the node (from each one's stamp) | 36 ms median | 38 ms median |
+| Camera frames lost | 0.3 % | 0.6 % |
+| Light ESS: valid depth, blind bins | 99.8 %, 0 % | 99.8 %, 0 % |
+
+zed_ros stamps the mid-exposure, the wrapper later in the frame: the age gain is larger than the
+2 ms shown. The dog's walk script in shadow on zed_ros (mr-neuro-nav walk_to_checkerboard.sh
+--stereo ess --record --health, 60 s): node 29.6 fps, capture to command 59 ms (p90 64), camera
+frames lost 0.5 %, the recording 8.0 MB/s with NVJPG.
+
 ### The camera lost frames under CPU load (open)
 
 The same night, every build lost frames while the CPUs were busy, from the kernel (uvcvideo's

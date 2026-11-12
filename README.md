@@ -162,17 +162,22 @@ the start, one offset for the whole file (an NTP step during recording shows on 
 The file's `zed` metadata has the settings, its `stats` metadata what was recorded and lost.
 
 ```
-zed_ros [--exposure active|gradient|camera] [--mains 50|60] [--eyes both|left|right]
+zed_ros [--images rect|raw|both] [--exposure active|gradient|camera] [--mains 50|60]
+        [--eyes both|left|right] [--rect FX,CX,CY] [--calibration SN.conf]
         [--best-effort] [--depth N] [--no-imu] [--prefix /zed] [--seconds S]
 ```
 
-Publishes the images (`/zed/<eye>/image_raw`, `sensor_msgs/Image` mono8, unrectified) and every
-IMU sample (`/zed/imu`) as ROS 2 topics, through [r2r](https://github.com/sequenceplanner/r2r).
-Both eyes carry the frame's stamp (the left image's mid-exposure, on the system clock), so an
-exact time synchroniser pairs them. Images over Fast DDS's shared memory need a segment larger
-than the default 512 KB on the publisher (`FASTRTPS_DEFAULT_PROFILES_FILE`): with 16 MB no frame
-was lost on the way, without it 0.4-2.6 % (docs/measurements.md). It is its own crate,
-`crates/zed-capture-ros`, built with a ROS 2 environment sourced (Humble or newer):
+Publishes the camera as ROS 2 topics, through [r2r](https://github.com/sequenceplanner/r2r):
+both eyes rectified (`/zed/<eye>/image_rect`, `sensor_msgs/Image` mono8, with
+`/zed/<eye>/camera_info`: no distortion, the right's P with the baseline, as the ZED wrapper's
+rectified images), or raw (`image_raw`), and every IMU sample (`/zed/imu`). Rectification is
+[Rudolf-V](https://github.com/twetto/Rudolf-V)'s from the camera's factory calibration (the file the
+ZED SDK downloaded), onto the left raw camera's fx, cx, cy unless `--rect`: 3.8 ms a frame on an
+Orin Nano. Both eyes carry the frame's stamp (the left image's mid-exposure, on the system
+clock), so an exact time synchroniser pairs them. Images over Fast DDS's shared memory need a
+segment larger than the default 512 KB on the publisher (`FASTRTPS_DEFAULT_PROFILES_FILE`): with
+16 MB no frame was lost on the way, without it 0.4-2.6 % (docs/measurements.md). It is its own
+crate, `crates/zed-capture-ros`, built with a ROS 2 environment sourced (Humble or newer):
 
 ```
 source /opt/ros/humble/setup.bash
