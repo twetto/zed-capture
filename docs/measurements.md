@@ -8,7 +8,9 @@ modes are not measured.
 
 Under load on the Orin Nano the ZED SDK lost 2-4 % of frames and up to 6 % of IMU samples (it keeps
 only the newest of each); V4L2 alone lost none. Details: mr-neuro-nav's
-`docs/idog/2026-11-03-30hz-recording-plan.md`.
+`docs/idog/2026-11-03-30hz-recording-plan.md`. Later both were found to lose frames in the kernel
+while jtop or htop runs, and none with a rebuilt uvcvideo: "The camera lost frames under CPU load"
+below.
 
 ## Frame sync
 
@@ -373,7 +375,8 @@ pipeline_node's; 60 s a case. Frames lost by the stamps' gaps:
 | No shared-memory profile on the publisher (512 KB segment) | node-like 2.55 %, plain 0.39 % left, 1.28 % right | 0 |
 
 With the 16 MB segment (mr-neuro-nav's `fastdds_shm16.xml`) the subscribers got every frame the
-camera gave. Publishing took 0.6-0.9 ms an image; images reached the subscribers 28-31 ms after
+camera gave. The camera's own losses here were the kernel's, with jtop and htop running ("The
+camera lost frames under CPU load", below). Publishing took 0.6-0.9 ms an image; images reached the subscribers 28-31 ms after
 their mid-exposure.
 
 Rectified (`--images rect`, Rudolf-V's maps applied byte to byte): the same as rudolf_v's own

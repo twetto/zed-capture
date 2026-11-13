@@ -12,11 +12,17 @@ The Stereolabs ZED 2 / 2i / Mini, read without the ZED SDK, on Linux, in Rust.
 - **Exposure**: the camera's auto exposure, zed-capture's own (both eyes one exposure, every
   frame's setting known), or a manual exposure and gain; the mains frequency for the anti-flicker.
 - **Python**: `zed_capture.Camera` (`crates/zed-capture-python`), frames as numpy arrays.
+- **ROS 2**: `zed_ros` (`crates/zed-capture-ros`), both eyes rectified with their camera_info and
+  every IMU sample, as topics.
+- **uvcvideo with a longer queue** (`dkms/`): with the kernel's, the camera drops frames while
+  jtop or htop runs.
 
 Why: the ZED SDK keeps only the newest frame and the newest IMU sample. Under load on a Jetson Orin
-Nano it lost 2-4 % of frames and up to 6 % of IMU samples, while V4L2 alone lost none.
+Nano it lost 2-4 % of frames and up to 6 % of IMU samples, while V4L2 alone lost none (unless jtop
+or htop runs, with the kernel's uvcvideo: below; the SDK reads through it too).
 
-Not included: the SDK's depth, tracking or rectification.
+Not included: the SDK's depth or tracking. Rectification is in `zed_ros` only (Rudolf-V's, from the
+factory calibration).
 
 ## Use
 
