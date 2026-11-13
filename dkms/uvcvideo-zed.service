@@ -1,0 +1,12 @@
+# zed-capture's uvcvideo for the running kernel: built if it is not yet (after a kernel update),
+# loaded if the camera is not open. Installed by dkms/install.sh, which fills in @DIR@.
+[Unit]
+Description=zed-capture's uvcvideo (32 transfers queued) for the running kernel
+
+[Service]
+# Not oneshot: a build waiting for the internet holds nothing else up
+Type=exec
+ExecStart=@DIR@/ensure.sh
+
+[Install]
+WantedBy=multi-user.target

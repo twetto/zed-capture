@@ -421,8 +421,24 @@ user-mode work cost 2 frames in 40 s, and loops re-reading sysfs or procfs files
 jtop and htop do that holds the worker off is theirs (likely their system calls), not load as
 such. Not pinned down further. The ZED SDK reads the camera through the same uvcvideo.
 
-So: no jtop (service or window) or htop while recording or driving. A longer queue in uvcvideo
-(more transfers: a rebuilt module) or a real-time worker would make it robust; neither is done.
+So with the kernel's uvcvideo: no jtop (service or window) or htop while recording or driving.
+
+### With a longer queue: uvcvideo with 32 transfers (dkms/)
+
+`dkms/` builds the kernel's own uvcvideo with 32 transfers queued instead of 5 (~9.5 ms of the
+stream instead of ~1.5; the longest wait seen above was 6.2 ms), checked to be the kernel's source
+before the change (the same srcversion). On LabOrin (JetPack 6.2, 5.15.199-tegra), 2026-11-13,
+with the jtop service running and a jtop and an htop window open:
+
+| test | kernel's uvcvideo (5) | 32 transfers |
+|---|---|---|
+| zed_count, 40 s, 2 busy threads | 1 lost | 0 of 1199 |
+| zed_count, 40 s, 4 busy threads | 11-25 lost | 0 of 1200 |
+| zed_count, 40 s, 6 busy threads | 0-22 lost | 0 of 1200 |
+| zed_ros + pipeline node, recorder, health logger | 0.5 % lost | 0 of 3073 (102 s); bag 0 of 2441 |
+
+The kernel's column is the night before's, with jtop and htop running (above). With 32 transfers
+they can stay.
 
 ## Not measured
 

@@ -104,6 +104,12 @@ and a request and its answer are two calls: another process's request between th
 answer. Don't run two programs that change camera settings (zed-capture, the ZED SDK, scripts)
 on one camera at once.
 
+**Frames lost while jtop or htop runs.** The camera streams ~110 MB/s over USB bulk, and the
+kernel's uvcvideo keeps only ~1.5 ms of it queued. When its copy work is held off longer (jtop and
+htop do it now and then) the camera's buffer overflows and it aborts the frame: on a Jetson Orin
+0.5 % of frames were lost with them running. The ZED SDK reads through the same driver. Either
+close them while recording, or install uvcvideo with a longer queue: below.
+
 **The IMU starts after the video's first frame.** `Camera` does this: on a ZED 2i, turning the
 IMU's stream on before the video's, or just after it, makes the video stop.
 
@@ -183,6 +189,34 @@ crate, `crates/zed-capture-ros`, built with a ROS 2 environment sourced (Humble 
 source /opt/ros/humble/setup.bash
 cd crates/zed-capture-ros && cargo build --release   # target/release/zed_ros
 ```
+
+## uvcvideo with a longer queue (dkms/)
+
+```
+sudo dkms/install.sh      # sudo dkms/uninstall.sh puts the kernel's back
+```
+
+Builds the kernel's own uvcvideo with 32 transfers queued for a stream instead of 5 (~9.5 ms of
+the camera's stream instead of ~1.5), through dkms: again for each new kernel. With it, nothing was
+lost with jtop and htop running ([docs/measurements.md](docs/measurements.md)).
+
+- The source is downloaded while building (`dkms/prepare.sh`): uvcvideo of the kernel's stable
+  release of the same version (5.15.199-tegra: v5.15.199), from kernel.org or its GitHub mirror.
+  It is used only if, built unchanged, it is the kernel's own module (the same srcversion); then
+  `UVC_URBS` becomes 32 and the version gets `-urbs32`. A kernel with a patched uvcvideo builds
+  nothing, and its own module stays.
+- `install.sh` installs dkms if it is missing (without its recommended packages, which on a Jetson
+  would be Ubuntu's kernel headers), builds the module, and loads it in place of the kernel's if no
+  program has the camera open. It needs the kernel's headers (JetPack: `nvidia-l4t-kernel-headers`)
+  and the internet.
+- Its service `uvcvideo-zed.service` builds it at boot if it is missing for the running kernel
+  (when a kernel update's dkms hook ran before the new headers were there), and loads it if the
+  camera is not open yet.
+- Loaded: `cat /sys/module/uvcvideo/version` says `1.1.1-urbs32`. The module is not signed, so the
+  kernel logs that it is tainted; a kernel that requires signed modules would not load it (JetPack
+  6 does not require them).
+
+Measured on JetPack 6.2 (L4T 36.5.2, 5.15.199-tegra) only.
 
 ## Building for a Jetson (JetPack 6)
 
