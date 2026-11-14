@@ -14,14 +14,17 @@ path = "src/main.rs"
 # The JPEG topics (<image>/nvjpg) on the Jetson's hardware encoder, through GStreamer: building
 # needs its development files (libgstreamer1.0-dev, libgstreamer-plugins-base1.0-dev); elsewhere
 # --no-default-features
-default = ["nvjpg"]
+default = ["nvjpg", "gpu"]
 nvjpg = ["zed-capture/nvjpg-encoder"]
+# Rectification on the GPU (Rudolf-V's, through wgpu and Vulkan); without it, or without a GPU at
+# run time, on the CPU
+gpu = ["rudolf-v/gpu"]
 
 [dependencies]
 zed-capture = { path = "../.." }
 libc = "0.2"
 r2r = "0.9.7"
-# Rectification (its CPU maps; no GPU)
+# Rectification: its maps, and on the GPU its GpuRectification (feature gpu)
 rudolf-v = { git = "https://github.com/twetto/Rudolf-V", rev = "410c678d97ae5db9129e759315632b51eb7b71b3", default-features = false }
 
 [profile.release]

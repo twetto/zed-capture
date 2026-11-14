@@ -175,7 +175,7 @@ The file's `zed` metadata has the settings, its `stats` metadata what was record
 
 ```
 zed_ros [--images rect|raw|both] [--exposure active|gradient|camera] [--mains 50|60]
-        [--eyes both|left|right] [--rect FX,CX,CY] [--calibration SN.conf]
+        [--eyes both|left|right] [--rect FX,CX,CY] [--calibration SN.conf] [--rectify gpu|cpu]
         [--no-jpeg] [--jpeg-quality 90] [--best-effort] [--depth N] [--no-imu]
         [--prefix /zed] [--seconds S]
 ```
@@ -188,16 +188,18 @@ JPEG from the Jetson's hardware encoder (NVJPG), on `<image topic>/nvjpg`
 (`sensor_msgs/CompressedImage`, for recording; as mr-neuro-nav's `nvjpg_encoder.py` publishes
 them), encoded in a thread of its own after the image went out (`--no-jpeg`: none). Rectification is
 [Rudolf-V](https://github.com/twetto/Rudolf-V)'s from the camera's factory calibration (the file the
-ZED SDK downloaded), onto the left raw camera's fx, cx, cy unless `--rect`: 3.8 ms a frame on an
-Orin Nano. Both eyes carry the frame's stamp (the left image's mid-exposure, on the system
+ZED SDK downloaded), onto the left raw camera's fx, cx, cy unless `--rect`; on the GPU (Rudolf-V's,
+through Vulkan: 2.9 ms a frame on an Orin Nano, checked against the CPU's when it starts) unless
+`--rectify cpu` or there is none (on the CPU: 3.8 ms on two free cores, 8 ms on zed_ros's two
+pinned ones beside the node). Both eyes carry the frame's stamp (the left image's mid-exposure, on the system
 clock), so an exact time synchroniser pairs them. Images over Fast DDS's shared memory need a
 segment larger than the default 512 KB on the publisher (`FASTRTPS_DEFAULT_PROFILES_FILE`): with
 16 MB no frame was lost on the way, without it 0.4-2.6 % (docs/measurements.md). It is its own
 crate, `crates/zed-capture-ros`, built with a ROS 2 environment sourced (Humble or newer). The
 JPEGs need GStreamer's development files to build (`libgstreamer1.0-dev`,
 `libgstreamer-plugins-base1.0-dev`) and JetPack's encoder to run; elsewhere build it with
-`--no-default-features` (no JPEG topics; a build with them on a machine without NVJPG says so and
-publishes the images alone):
+`--no-default-features` (no JPEG topics, rectification on the CPU; `--features gpu` keeps the
+GPU's). A build with them on a machine without NVJPG or a Vulkan GPU says so and does without:
 
 ```
 source /opt/ros/humble/setup.bash

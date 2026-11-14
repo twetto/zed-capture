@@ -1,7 +1,7 @@
 //! The ZED's frames and IMU as ROS 2 topics, from zed-capture (no ZED SDK), through r2r.
 //!
 //!   zed_ros [--images rect|raw|both] [--exposure active|gradient|camera] [--mains 50|60]
-//!           [--eyes both|left|right] [--rect FX,CX,CY] [--calibration SN.conf]
+//!           [--eyes both|left|right] [--rect FX,CX,CY] [--calibration SN.conf] [--rectify gpu|cpu]
 //!           [--no-jpeg] [--jpeg-quality 90] [--best-effort] [--depth N] [--no-imu]
 //!           [--prefix /zed] [--seconds S]
 //!
@@ -21,7 +21,9 @@
 //!
 //! Rectification is Rudolf-V's, from the camera's factory calibration (the ZED SDK downloads it to
 //! /usr/local/zed/settings/SN<serial>.conf; --calibration to name another), onto a pinhole camera
-//! with fx = fy: by default the left raw camera's fx, cx and cy, --rect to choose.
+//! with fx = fy: by default the left raw camera's fx, cx and cy, --rect to choose. On the GPU
+//! (Rudolf-V's, Vulkan; the first frame checked against the CPU's) unless --rectify cpu, there is
+//! no GPU, or it is built without the feature gpu.
 //!
 //! Both eyes' messages carry the frame's stamp, so that an exact time synchroniser pairs them: the
 //! middle of the left image's middle row's exposure (with the camera's own auto exposure the
@@ -60,7 +62,7 @@ extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
-const USAGE: &str = "usage: zed_ros [--images rect|raw|both] [--exposure active|gradient|camera] [--mains 50|60] [--eyes both|left|right] [--rect FX,CX,CY] [--calibration SN.conf] [--no-jpeg] [--jpeg-quality 90] [--best-effort] [--depth N] [--no-imu] [--prefix /zed] [--seconds S]";
+const USAGE: &str = "usage: zed_ros [--images rect|raw|both] [--exposure active|gradient|camera] [--mains 50|60] [--eyes both|left|right] [--rect FX,CX,CY] [--calibration SN.conf] [--rectify gpu|cpu] [--no-jpeg] [--jpeg-quality 90] [--best-effort] [--depth N] [--no-imu] [--prefix /zed] [--seconds S]";
 
 /// After this long without a frame the camera is opened again.
 const STALL: Duration = Duration::from_secs(3);
@@ -78,6 +80,7 @@ struct Args {
     eyes: [bool; 2],
     camera: Option<[f64; 3]>,
     calibration: Option<PathBuf>,
+    rectify_gpu: bool,
     jpeg: bool,
     jpeg_quality: u8,
     best_effort: bool,
@@ -96,6 +99,7 @@ fn args() -> Result<Args, String> {
         eyes: [true, true],
         camera: None,
         calibration: None,
+        rectify_gpu: true,
         jpeg: true,
         jpeg_quality: 90,
         best_effort: false,
@@ -159,6 +163,13 @@ fn args() -> Result<Args, String> {
                 a.camera = Some([fx, cx, cy]);
             }
             "--calibration" => a.calibration = Some(value.into()),
+            "--rectify" => {
+                a.rectify_gpu = match value.as_str() {
+                    "gpu" => true,
+                    "cpu" => false,
+                    _ => return Err(bad()),
+                }
+            }
             "--jpeg-quality" => {
                 a.jpeg_quality = value
                     .parse()
@@ -395,7 +406,39 @@ fn run(a: Args) -> Result<(), String> {
         }),
         ..Default::default()
     };
-    // ROS and the JPEG encoders first (~0.3 s): the camera's frames would wait in its ring
+    // The rectifier, ROS and the JPEG encoders before the camera (~1 s with the GPU's): the
+    // camera's frames would wait in its ring meanwhile
+    let serial = zed_capture::find()
+        .map_err(|e| format!("finding the ZED: {e}"))?
+        .serial;
+    let mut rectifier = match a.rect {
+        true => {
+            let path = a
+                .calibration
+                .clone()
+                .or_else(|| {
+                    serial
+                        .as_ref()
+                        .map(|s| format!("/usr/local/zed/settings/SN{s}.conf").into())
+                })
+                .ok_or(
+                    "the camera's serial number is unknown: name its calibration (--calibration)",
+                )?;
+            let (w, h) = (config.eye_width as usize, config.height as usize);
+            let r = Rectifier::from_zed_conf(&path, w, h, a.camera, a.rectify_gpu)?;
+            eprintln!(
+                "zed_ros: rectifying by {} onto fx {:.3}, cx {:.3}, cy {:.3}, baseline {:.5} m, {}",
+                path.display(),
+                r.fx,
+                r.cx,
+                r.cy,
+                r.baseline,
+                r.place()
+            );
+            Some(r)
+        }
+        false => None,
+    };
     let ros = |e: r2r::Error| format!("ROS: {e}");
     let ctx = r2r::Context::create().map_err(ros)?;
     let mut node = r2r::Node::create(ctx, "zed_ros", "").map_err(ros)?;
@@ -465,35 +508,8 @@ fn run(a: Args) -> Result<(), String> {
         false => None,
     };
     eprintln!("zed_ros: opening the ZED ({} exposure)", a.exposure);
-    let (cam, serial) = open(&config)?;
+    let (cam, _) = open(&config)?;
     let mut camera = Some(cam);
-    let rectifier = match a.rect {
-        true => {
-            let path = a
-                .calibration
-                .clone()
-                .or_else(|| {
-                    serial
-                        .as_ref()
-                        .map(|s| format!("/usr/local/zed/settings/SN{s}.conf").into())
-                })
-                .ok_or(
-                    "the camera's serial number is unknown: name its calibration (--calibration)",
-                )?;
-            let (w, h) = (config.eye_width as usize, config.height as usize);
-            let r = Rectifier::from_zed_conf(&path, w, h, a.camera)?;
-            eprintln!(
-                "zed_ros: rectifying by {} onto fx {:.3}, cx {:.3}, cy {:.3}, baseline {:.5} m",
-                path.display(),
-                r.fx,
-                r.cx,
-                r.cy,
-                r.baseline
-            );
-            Some(r)
-        }
-        false => None,
-    };
     let eyes: Vec<&str> = (0..2).filter(|&e| a.eyes[e]).map(|e| EYES[e]).collect();
     let kinds: Vec<&str> = [(a.rect, "image_rect,camera_info"), (a.raw, "image_raw")]
         .iter()
@@ -573,7 +589,7 @@ fn run(a: Args) -> Result<(), String> {
             frame_id: format!("zed_{}_camera_optical_frame", EYES[eye]),
         };
         let (w, h) = (frame.width, frame.height);
-        let rectified = rectifier.as_ref().map(|r| {
+        let rectified = rectifier.as_mut().map(|r| {
             let t0 = Instant::now();
             let pair = r.rectify_pair([&frame.left, &frame.right]);
             let ns = t0.elapsed().as_nanos() as u64;

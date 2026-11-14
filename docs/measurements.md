@@ -381,7 +381,13 @@ the subscribers 28-31 ms after their mid-exposure.
 
 Rectified (`--images rect`, Rudolf-V's maps applied byte to byte): the same as rudolf_v's own
 rectification of the raw pair, every pixel (0 of 921600 differ, both eyes). 6.8 ms a frame with a
-thread an eye, 3.8 ms with two; 8-9 ms on two pinned CPUs beside the node.
+thread an eye, 3.8 ms with two; 8-9 ms on two pinned CPUs beside the node. On the GPU (Rudolf-V's
+`GpuRectification`, the default since 2026-11-14): 3.0 ms a frame on zed_ros's two pinned CPUs
+beside the node; against the CPU's on a noise pair, 5 of 1,843,200 pixels a grey level apart
+(its fused multiply-adds), on a camera frame none. mr-neuro-nav's walk in shadow with recording,
+80 s, twice each, CPU against GPU: zed_ros 0.59 cores against 0.36, all CPUs 2.9 against 2.6,
+the image's age at the node 36 ms against 32 (capture to command 57 against 52), Light ESS's
+11.0 ms a pair unchanged beside it, no frame lost either way.
 
 The pipeline node (mr-neuro-nav) in shadow on LabOrin (60 s, Light ESS on both eyes, zed_ros or
 the ZED wrapper on CPUs 0-1, the node on 2-5, a stand-in dog stream; the same view):
