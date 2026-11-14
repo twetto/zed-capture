@@ -376,8 +376,8 @@ pipeline_node's; 60 s a case. Frames lost by the stamps' gaps:
 
 With the 16 MB segment (mr-neuro-nav's `fastdds_shm16.xml`) the subscribers got every frame the
 camera gave. The camera's own losses here were the kernel's, with jtop and htop running ("The
-camera lost frames under CPU load", below). Publishing took 0.6-0.9 ms an image; images reached the subscribers 28-31 ms after
-their mid-exposure.
+camera lost frames under CPU load", below). Publishing took 0.6-0.9 ms an image; images reached
+the subscribers 28-31 ms after their mid-exposure.
 
 Rectified (`--images rect`, Rudolf-V's maps applied byte to byte): the same as rudolf_v's own
 rectification of the raw pair, every pixel (0 of 921600 differ, both eyes). 6.8 ms a frame with a
@@ -397,6 +397,27 @@ zed_ros stamps the mid-exposure, the wrapper later in the frame: the age gain is
 2 ms shown. The dog's walk script in shadow on zed_ros (mr-neuro-nav walk_to_checkerboard.sh
 --stereo ess --record --health, 60 s): node 29.6 fps, capture to command 59 ms (p90 64), camera
 frames lost 0.5 %, the recording 8.0 MB/s with NVJPG.
+
+### Its JPEG topics (NVJPG)
+
+Each image's JPEG on `<image topic>/nvjpg`, from the Jetson's encoder in a thread a stream, after
+the image went out. LabOrin, 2026-11-14, rectified HD720, quality 90: 6.2 ms an image (at most
+~13), 105-118 KB, none skipped; every JPEG had its image's stamp; decoded, it differs from the
+image by 0.5-0.6 levels on average (at most 13-15), PSNR 48-50 dB. The first JPEG of a pipeline
+takes ~150 ms, so each is tried on a blank image first, before the camera opens (else 2-13 frames
+waited too long in the ring at the start).
+
+Against mr-neuro-nav's `nvjpg_encoder.py` (a Python process encoding the published images, as
+before), in the walk script's shadow run with recording and health logger, 80 s each, twice,
+jtop and htop running, uvcvideo with 32 transfers:
+
+| | zed_ros + nvjpg_encoder.py | zed_ros with its JPEGs |
+|---|---|---|
+| All CPUs busy (of 6) | 3.32, 3.23 | 3.03, 3.01 |
+| JPEG encoding | the encoder: 0.47, 0.33 cores | zed_ros 0.61 cores instead of 0.45 |
+| The node: process time, median (p90) | 22.1 (26.1), 21.7 (25.0) ms | 20.4 (22.5), 20.2 (22.4) ms |
+| Capture to command (median) | 56 ms | 53 ms |
+| Camera frames lost; bag frames missing | 0; 0 | 0; 0 |
 
 ### The camera lost frames under CPU load: monitoring tools delaying uvcvideo
 

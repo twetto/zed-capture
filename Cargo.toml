@@ -18,13 +18,16 @@ libc = "0.2"
 # zed_record's: MCAP without zstd/lz4 (JPEG does not compress), JPEG in pure Rust
 mcap = { version = "0.26", default-features = false, optional = true }
 jpeg-encoder = { version = "0.7", optional = true }
-# zed_record --encoding nvjpg: the Jetson's JPEG encoder through GStreamer (build on the Jetson)
+# The Jetson's JPEG encoder through GStreamer (zed_capture::nvjpg; zed_record --encoding nvjpg,
+# zed_ros's JPEG topics): build on the Jetson
 gstreamer = { version = "0.25", optional = true }
 gstreamer-app = { version = "0.25", optional = true }
 
 [features]
 record = ["dep:mcap", "dep:jpeg-encoder"]
-nvjpg = ["record", "dep:gstreamer", "dep:gstreamer-app"]
+# zed_capture::nvjpg alone
+nvjpg-encoder = ["dep:gstreamer", "dep:gstreamer-app"]
+nvjpg = ["record", "nvjpg-encoder"]
 
 [[bin]]
 name = "zed_record"

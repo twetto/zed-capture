@@ -10,6 +10,13 @@ description = "zed_ros: a ZED's frames and IMU as ROS 2 topics, from zed-capture
 name = "zed_ros"
 path = "src/main.rs"
 
+[features]
+# The JPEG topics (<image>/nvjpg) on the Jetson's hardware encoder, through GStreamer: building
+# needs its development files (libgstreamer1.0-dev, libgstreamer-plugins-base1.0-dev); elsewhere
+# --no-default-features
+default = ["nvjpg"]
+nvjpg = ["zed-capture/nvjpg-encoder"]
+
 [dependencies]
 zed-capture = { path = "../.." }
 libc = "0.2"

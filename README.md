@@ -12,8 +12,8 @@ The Stereolabs ZED 2 / 2i / Mini, read without the ZED SDK, on Linux, in Rust.
 - **Exposure**: the camera's auto exposure, zed-capture's own (both eyes one exposure, every
   frame's setting known), or a manual exposure and gain; the mains frequency for the anti-flicker.
 - **Python**: `zed_capture.Camera` (`crates/zed-capture-python`), frames as numpy arrays.
-- **ROS 2**: `zed_ros` (`crates/zed-capture-ros`), both eyes rectified with their camera_info and
-  every IMU sample, as topics.
+- **ROS 2**: `zed_ros` (`crates/zed-capture-ros`), both eyes rectified with their camera_info, their
+  JPEGs from the Jetson's hardware encoder, and every IMU sample, as topics.
 - **uvcvideo with a longer queue** (`dkms/`): with the kernel's, the camera drops frames while
   jtop or htop runs.
 
@@ -176,20 +176,28 @@ The file's `zed` metadata has the settings, its `stats` metadata what was record
 ```
 zed_ros [--images rect|raw|both] [--exposure active|gradient|camera] [--mains 50|60]
         [--eyes both|left|right] [--rect FX,CX,CY] [--calibration SN.conf]
-        [--best-effort] [--depth N] [--no-imu] [--prefix /zed] [--seconds S]
+        [--no-jpeg] [--jpeg-quality 90] [--best-effort] [--depth N] [--no-imu]
+        [--prefix /zed] [--seconds S]
 ```
 
 Publishes the camera as ROS 2 topics, through [r2r](https://github.com/sequenceplanner/r2r):
 both eyes rectified (`/zed/<eye>/image_rect`, `sensor_msgs/Image` mono8, with
 `/zed/<eye>/camera_info`: no distortion, the right's P with the baseline, as the ZED wrapper's
-rectified images), or raw (`image_raw`), and every IMU sample (`/zed/imu`). Rectification is
+rectified images), or raw (`image_raw`), and every IMU sample (`/zed/imu`). Each image also as a
+JPEG from the Jetson's hardware encoder (NVJPG), on `<image topic>/nvjpg`
+(`sensor_msgs/CompressedImage`, for recording; as mr-neuro-nav's `nvjpg_encoder.py` publishes
+them), encoded in a thread of its own after the image went out (`--no-jpeg`: none). Rectification is
 [Rudolf-V](https://github.com/twetto/Rudolf-V)'s from the camera's factory calibration (the file the
 ZED SDK downloaded), onto the left raw camera's fx, cx, cy unless `--rect`: 3.8 ms a frame on an
 Orin Nano. Both eyes carry the frame's stamp (the left image's mid-exposure, on the system
 clock), so an exact time synchroniser pairs them. Images over Fast DDS's shared memory need a
 segment larger than the default 512 KB on the publisher (`FASTRTPS_DEFAULT_PROFILES_FILE`): with
 16 MB no frame was lost on the way, without it 0.4-2.6 % (docs/measurements.md). It is its own
-crate, `crates/zed-capture-ros`, built with a ROS 2 environment sourced (Humble or newer):
+crate, `crates/zed-capture-ros`, built with a ROS 2 environment sourced (Humble or newer). The
+JPEGs need GStreamer's development files to build (`libgstreamer1.0-dev`,
+`libgstreamer-plugins-base1.0-dev`) and JetPack's encoder to run; elsewhere build it with
+`--no-default-features` (no JPEG topics; a build with them on a machine without NVJPG says so and
+publishes the images alone):
 
 ```
 source /opt/ros/humble/setup.bash

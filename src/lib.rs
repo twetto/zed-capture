@@ -11,6 +11,7 @@
 //!   and the middle of it ([`sensor`]), and the IMU samples up to it ([`clock`]).
 //! - [`find`]: the camera's video and hidraw devices, from sysfs; it gives the IMU back to the
 //!   kernel when the ZED SDK left it detached ([`reattach_hid`]).
+//! - [`nvjpg`] (feature `nvjpg-encoder`, on a Jetson): grey images to JPEG on its hardware encoder.
 //!
 //! The USB protocol (report layout, scales, the stream and ping requests) follows Stereolabs'
 //! zed-open-capture (MIT). Unlike it and the SDK, nothing here keeps only the newest frame or
@@ -22,6 +23,8 @@ pub mod camera;
 pub mod clock;
 pub mod device;
 pub mod imu;
+#[cfg(feature = "nvjpg-encoder")]
+pub mod nvjpg;
 pub mod sensor;
 mod sys;
 pub mod video;

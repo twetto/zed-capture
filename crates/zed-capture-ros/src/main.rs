@@ -2,7 +2,8 @@
 //!
 //!   zed_ros [--images rect|raw|both] [--exposure active|gradient|camera] [--mains 50|60]
 //!           [--eyes both|left|right] [--rect FX,CX,CY] [--calibration SN.conf]
-//!           [--best-effort] [--depth N] [--no-imu] [--prefix /zed] [--seconds S]
+//!           [--no-jpeg] [--jpeg-quality 90] [--best-effort] [--depth N] [--no-imu]
+//!           [--prefix /zed] [--seconds S]
 //!
 //! Topics, under --prefix (default /zed), for each eye published:
 //!   <eye>/image_rect     sensor_msgs/Image, mono8, rectified (--images rect, the default, or both)
@@ -10,6 +11,12 @@
 //!                        rectified camera, the right's P with the baseline (Tx = -fx B), as the
 //!                        ZED wrapper publishes for its rectified images
 //!   <eye>/image_raw      sensor_msgs/Image, mono8, unrectified (--images raw or both)
+//!   <image topic>/nvjpg  sensor_msgs/CompressedImage: each image's JPEG from the Jetson's hardware
+//!                        encoder (NVJPG; zed-capture's `nvjpg`), as mr-neuro-nav's nvjpg_encoder.py
+//!                        publishes it ("bgr8; jpeg compressed bgr8", the chroma flat; reliable,
+//!                        keep-last 10), encoded in a thread of its own after the image went out;
+//!                        unless --no-jpeg. Without NVJPG (not a Jetson, or built without the
+//!                        feature nvjpg) there are none, and it says so
 //!   imu                  sensor_msgs/Imu: every sample, the IMU's own axes, no orientation
 //!
 //! Rectification is Rudolf-V's, from the camera's factory calibration (the ZED SDK downloads it to
@@ -29,13 +36,16 @@
 //! 512 KB (FASTRTPS_DEFAULT_PROFILES_FILE; mr-neuro-nav's scripts/idog/fastdds_shm16.xml): with it
 //! subscribers got every frame, without it they lost 0.4-2.6 %.
 
+mod jpeg;
 mod rectify;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use jpeg::{JpegCounts, JpegStats, JpegStream};
 use r2r::QosProfile;
 use r2r::builtin_interfaces::msg::Time;
 use r2r::geometry_msgs::msg::Vector3;
@@ -50,7 +60,7 @@ extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
-const USAGE: &str = "usage: zed_ros [--images rect|raw|both] [--exposure active|gradient|camera] [--mains 50|60] [--eyes both|left|right] [--rect FX,CX,CY] [--calibration SN.conf] [--best-effort] [--depth N] [--no-imu] [--prefix /zed] [--seconds S]";
+const USAGE: &str = "usage: zed_ros [--images rect|raw|both] [--exposure active|gradient|camera] [--mains 50|60] [--eyes both|left|right] [--rect FX,CX,CY] [--calibration SN.conf] [--no-jpeg] [--jpeg-quality 90] [--best-effort] [--depth N] [--no-imu] [--prefix /zed] [--seconds S]";
 
 /// After this long without a frame the camera is opened again.
 const STALL: Duration = Duration::from_secs(3);
@@ -68,6 +78,8 @@ struct Args {
     eyes: [bool; 2],
     camera: Option<[f64; 3]>,
     calibration: Option<PathBuf>,
+    jpeg: bool,
+    jpeg_quality: u8,
     best_effort: bool,
     depth: usize,
     imu: bool,
@@ -84,6 +96,8 @@ fn args() -> Result<Args, String> {
         eyes: [true, true],
         camera: None,
         calibration: None,
+        jpeg: true,
+        jpeg_quality: 90,
         best_effort: false,
         depth: 1,
         imu: true,
@@ -99,6 +113,10 @@ fn args() -> Result<Args, String> {
             }
             "--no-imu" => {
                 a.imu = false;
+                continue;
+            }
+            "--no-jpeg" => {
+                a.jpeg = false;
                 continue;
             }
             "-h" | "--help" => return Err(USAGE.into()),
@@ -141,6 +159,13 @@ fn args() -> Result<Args, String> {
                 a.camera = Some([fx, cx, cy]);
             }
             "--calibration" => a.calibration = Some(value.into()),
+            "--jpeg-quality" => {
+                a.jpeg_quality = value
+                    .parse()
+                    .ok()
+                    .filter(|q| (1..=100).contains(q))
+                    .ok_or_else(bad)?
+            }
             "--depth" => a.depth = value.parse().ok().filter(|&d| d > 0).ok_or_else(bad)?,
             "--prefix" => a.prefix = value.trim_end_matches('/').to_string(),
             "--seconds" => a.seconds = Some(value.parse().map_err(|_| bad())?),
@@ -289,6 +314,63 @@ struct EyePubs {
     rect: Option<r2r::Publisher<Image>>,
     info: Option<r2r::Publisher<CameraInfo>>,
     raw: Option<r2r::Publisher<Image>>,
+    /// The JPEGs of `rect`'s and `raw`'s images.
+    jpeg: [Option<JpegStream>; 2],
+}
+
+/// The JPEG streams of the images published, by eye: rect's and raw's. All or none: an encoder
+/// for each first, each tried once, then their publishers.
+#[cfg(feature = "nvjpg")]
+fn jpeg_streams(
+    node: &mut r2r::Node,
+    pubs: &mut [EyePubs],
+    prefix: &str,
+    (width, height): (usize, usize),
+    quality: u8,
+    stats: &Arc<JpegStats>,
+) -> Result<(), String> {
+    use r2r::sensor_msgs::msg::CompressedImage;
+    let mut streams = Vec::new();
+    for (eye, p) in pubs.iter().enumerate() {
+        for (kind, (name, on)) in [
+            ("image_rect", p.rect.is_some()),
+            ("image_raw", p.raw.is_some()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if on {
+                streams.push((eye, kind, format!("{prefix}/{}/{name}/nvjpg", EYES[eye])));
+            }
+        }
+    }
+    // Each one tried on a blank image (Nvjpg::new)
+    let encoders = streams
+        .iter()
+        .map(|_| zed_capture::nvjpg::Nvjpg::new(width, height, quality))
+        .collect::<Result<Vec<_>, _>>()?;
+    for ((eye, kind, topic), encoder) in streams.into_iter().zip(encoders) {
+        let publisher = node
+            .create_publisher::<CompressedImage>(
+                &topic,
+                QosProfile::default().keep_last(10).reliable(),
+            )
+            .map_err(|e| format!("ROS: {e}"))?;
+        pubs[eye].jpeg[kind] = Some(JpegStream::start(encoder, publisher, stats.clone()));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "nvjpg"))]
+fn jpeg_streams(
+    _: &mut r2r::Node,
+    _: &mut [EyePubs],
+    _: &str,
+    _: (usize, usize),
+    _: u8,
+    _: &Arc<JpegStats>,
+) -> Result<(), String> {
+    Err("built without the feature nvjpg".into())
 }
 
 fn image(header: Header, width: usize, height: usize, data: Vec<u8>) -> Image {
@@ -313,37 +395,7 @@ fn run(a: Args) -> Result<(), String> {
         }),
         ..Default::default()
     };
-    eprintln!("zed_ros: opening the ZED ({} exposure)", a.exposure);
-    let (cam, serial) = open(&config)?;
-    let mut camera = Some(cam);
-    let rectifier = match a.rect {
-        true => {
-            let path = a
-                .calibration
-                .clone()
-                .or_else(|| {
-                    serial
-                        .as_ref()
-                        .map(|s| format!("/usr/local/zed/settings/SN{s}.conf").into())
-                })
-                .ok_or(
-                    "the camera's serial number is unknown: name its calibration (--calibration)",
-                )?;
-            let (w, h) = (config.eye_width as usize, config.height as usize);
-            let r = Rectifier::from_zed_conf(&path, w, h, a.camera)?;
-            eprintln!(
-                "zed_ros: rectifying by {} onto fx {:.3}, cx {:.3}, cy {:.3}, baseline {:.5} m",
-                path.display(),
-                r.fx,
-                r.cx,
-                r.cy,
-                r.baseline
-            );
-            Some(r)
-        }
-        false => None,
-    };
-
+    // ROS and the JPEG encoders first (~0.3 s): the camera's frames would wait in its ring
     let ros = |e: r2r::Error| format!("ROS: {e}");
     let ctx = r2r::Context::create().map_err(ros)?;
     let mut node = r2r::Node::create(ctx, "zed_ros", "").map_err(ros)?;
@@ -379,8 +431,29 @@ fn run(a: Args) -> Result<(), String> {
                 ),
                 false => None,
             },
+            jpeg: [None, None],
         });
     }
+    let jpeg_stats = Arc::new(JpegStats::default());
+    let size = (config.eye_width as usize, config.height as usize);
+    let jpeg = a.jpeg
+        && match jpeg_streams(
+            &mut node,
+            &mut pubs,
+            &a.prefix,
+            size,
+            a.jpeg_quality,
+            &jpeg_stats,
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("zed_ros: no JPEG topics: {e}");
+                for p in &mut pubs {
+                    p.jpeg = [None, None];
+                }
+                false
+            }
+        };
     let imu_pub = match a.imu {
         true => Some(
             node.create_publisher::<Imu>(
@@ -391,6 +464,36 @@ fn run(a: Args) -> Result<(), String> {
         ),
         false => None,
     };
+    eprintln!("zed_ros: opening the ZED ({} exposure)", a.exposure);
+    let (cam, serial) = open(&config)?;
+    let mut camera = Some(cam);
+    let rectifier = match a.rect {
+        true => {
+            let path = a
+                .calibration
+                .clone()
+                .or_else(|| {
+                    serial
+                        .as_ref()
+                        .map(|s| format!("/usr/local/zed/settings/SN{s}.conf").into())
+                })
+                .ok_or(
+                    "the camera's serial number is unknown: name its calibration (--calibration)",
+                )?;
+            let (w, h) = (config.eye_width as usize, config.height as usize);
+            let r = Rectifier::from_zed_conf(&path, w, h, a.camera)?;
+            eprintln!(
+                "zed_ros: rectifying by {} onto fx {:.3}, cx {:.3}, cy {:.3}, baseline {:.5} m",
+                path.display(),
+                r.fx,
+                r.cx,
+                r.cy,
+                r.baseline
+            );
+            Some(r)
+        }
+        false => None,
+    };
     let eyes: Vec<&str> = (0..2).filter(|&e| a.eyes[e]).map(|e| EYES[e]).collect();
     let kinds: Vec<&str> = [(a.rect, "image_rect,camera_info"), (a.raw, "image_raw")]
         .iter()
@@ -398,15 +501,24 @@ fn run(a: Args) -> Result<(), String> {
         .map(|(_, k)| *k)
         .collect();
     eprintln!(
-        "zed_ros: publishing {}/{{{}}}/{{{}}}{}",
+        "zed_ros: publishing {}/{{{}}}/{{{}}}{}{}",
         a.prefix,
         eyes.join(","),
         kinds.join(","),
+        if jpeg {
+            format!(
+                ", their images' JPEGs (.../nvjpg, quality {})",
+                a.jpeg_quality
+            )
+        } else {
+            String::new()
+        },
         if a.imu { " and imu" } else { "" }
     );
 
     let started = Instant::now();
     let (mut period, mut total) = (Counts::default(), Counts::default());
+    let mut jpeg_total = JpegCounts::default();
     let mut last_log = Instant::now();
     let mut last_frame = Instant::now();
     let (mut stalls, mut lost, mut ring_drops) = (0u64, 0u64, 0u64);
@@ -478,7 +590,11 @@ fn run(a: Args) -> Result<(), String> {
             if let (Some(publisher), Some(data)) =
                 (&p.rect, rectified.as_mut().and_then(|r| r[eye].take()))
             {
-                period.publish(publisher, &image(header(eye), w, h, data));
+                let msg = image(header(eye), w, h, data);
+                period.publish(publisher, &msg);
+                if let Some(j) = &p.jpeg[0] {
+                    j.send(msg.header, msg.data);
+                }
             }
             if let (Some(publisher), Some(r)) = (&p.info, &rectifier)
                 && publisher
@@ -489,7 +605,11 @@ fn run(a: Args) -> Result<(), String> {
             }
             if let Some(publisher) = &p.raw {
                 let data = std::mem::take(&mut raw[eye]);
-                period.publish(publisher, &image(header(eye), w, h, data));
+                let msg = image(header(eye), w, h, data);
+                period.publish(publisher, &msg);
+                if let Some(j) = &p.jpeg[1] {
+                    j.send(msg.header, msg.data);
+                }
             }
         }
         if let Some(p) = &imu_pub {
@@ -512,10 +632,12 @@ fn run(a: Args) -> Result<(), String> {
                 })
                 .collect();
             let [publish, publish_max, rect, rect_max] = period.ms();
+            let jpegs = jpeg_stats.take();
+            jpeg_total.add(&jpegs);
             eprintln!(
                 "zed_ros: {:.0} s: {} frames ({:.2}/s), rectified in {rect:.2} ms (at most \
                  {rect_max:.2}), {} images published in {publish:.2} ms each (at most \
-                 {publish_max:.2}), {} IMU samples, {} errors; lost {} by the camera ({} bad \
+                 {publish_max:.2}), {} IMU samples, {} errors{}; lost {} by the camera ({} bad \
                  buffers, {} sequence numbers skipped, longest {:.1} ms between frames), {} from \
                  the ring; image subscribers {}",
                 started.elapsed().as_secs_f64(),
@@ -524,6 +646,11 @@ fn run(a: Args) -> Result<(), String> {
                 period.images,
                 period.imu,
                 period.errors,
+                if jpeg {
+                    format!("; {}", jpegs.summary())
+                } else {
+                    String::new()
+                },
                 lost + v.missing_by_time,
                 v.bad_buffers,
                 v.missing_by_sequence,
@@ -537,6 +664,11 @@ fn run(a: Args) -> Result<(), String> {
         }
     }
     total.add(&period);
+    // The JPEG threads finish what waits
+    for p in &mut pubs {
+        p.jpeg = [None, None];
+    }
+    jpeg_total.add(&jpeg_stats.take());
     if let Some(cam) = &camera {
         let v = cam.video().stats();
         lost += v.missing_by_time;
@@ -546,13 +678,18 @@ fn run(a: Args) -> Result<(), String> {
     eprintln!(
         "zed_ros: done after {:.1} s: {} frames (rectified in {rect:.2} ms, at most \
          {rect_max:.2}), {} images published ({publish:.2} ms each, at most {publish_max:.2}), \
-         {} IMU samples, {} errors; lost {lost} by the camera, {ring_drops} from the ring; \
+         {} IMU samples, {} errors{}; lost {lost} by the camera, {ring_drops} from the ring; \
          {stalls} stalls",
         started.elapsed().as_secs_f64(),
         total.frames,
         total.images,
         total.imu,
         total.errors,
+        if jpeg {
+            format!("; {}", jpeg_total.summary())
+        } else {
+            String::new()
+        },
     );
     Ok(())
 }

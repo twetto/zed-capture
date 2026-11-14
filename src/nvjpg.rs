@@ -28,6 +28,8 @@ fn element<T: IsA<gst::Element>>(pipeline: &gst::Pipeline, name: &str) -> Result
 }
 
 impl Nvjpg {
+    /// The pipeline for `width × height` images at JPEG `quality`, tried on a blank image: the
+    /// first JPEG takes ~150 ms, which would hold up the first frames' (a recording's first 2-4).
     pub fn new(width: usize, height: usize, quality: u8) -> Result<Nvjpg, String> {
         gst::init().map_err(|e| format!("GStreamer: {e}"))?;
         let description = format!(
@@ -44,13 +46,15 @@ impl Nvjpg {
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| format!("starting the NVJPG pipeline: {e}"))?;
-        Ok(Nvjpg {
+        let n = Nvjpg {
             pipeline,
             src,
             sink,
             width,
             height,
-        })
+        };
+        n.encode(vec![0; width * height])?;
+        Ok(n)
     }
 
     /// The JPEG of a grey image (`width × height` bytes, rows unpadded).

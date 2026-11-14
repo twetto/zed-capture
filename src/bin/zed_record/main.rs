@@ -27,7 +27,7 @@
 mod cdr;
 mod msgs;
 #[cfg(feature = "nvjpg")]
-mod nvjpg;
+use zed_capture::nvjpg;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
